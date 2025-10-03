@@ -1,0 +1,4167 @@
+From 9da176673f9d317110dbd31c39553a7ad9489d7f Mon Sep 17 00:00:00 2001
+From: aallidin <aallidin@cisco.com>
+Date: Thu, 28 Aug 2025 22:37:21 -0400
+Subject: [PATCH] Creation
+
+---
+ driver/Common.h              |  17 ++
+ driver/Communication.cpp     | 148 +++++++++++++++
+ driver/Communication.h       |  26 +++
+ driver/Driver.cpp            |  45 +++++
+ driver/Driver.h              |   8 +
+ driver/FileContext.h         |  47 +++++
+ driver/MiniFilter.cpp        | 434 +++++++++++++++++++++++++++++++++++++++++++
+ driver/StreamContext.h       |  50 +++++
+ driver/StreamHandleContext.h |  63 +++++++
+ driver/VolumeContext.h       | 177 ++++++++++++++++++
+ driver/pch.cpp               |   1 +
+ driver/pch.h                 |   7 +
+ driver/pooltag.h             |   7 +
+ 13 files changed, 1030 insertions(+)
+
+diff --git a/driver/Common.h b/driver/Common.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..1bcafca21094701dda7cfae74aeb91fc61935016
+--- /dev/null
++++ b/driver/Common.h
+@@ -0,0 +1,17 @@
++#pragma once
++
++enum class PortMessageType {
++	VolumeMessage = 1,
++	FileMessage = 2,
++	ErrorMessage = 4,
++};
++
++struct PortMessage {
++	PortMessageType type;
++	ULONG dataLenBytes;
++    UCHAR data[1]; // Variable length data follows
++};
++
++#define FILTER_PORT_NAME L"\\BackupPort"
++
++constexpr ULONG COMMUNICATION_BUFFER_LEN = 1 << 12; // 4 KB
+diff --git a/driver/Communication.cpp b/driver/Communication.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..11394b7a899546955a246909c6575086015a56b1
+--- /dev/null
++++ b/driver/Communication.cpp
+@@ -0,0 +1,148 @@
++#include "pch.h"
++
++#include "Communication.h"
++#include "pooltag.h"
++
++static PFLT_PORT s_Port = nullptr;
++static PFLT_PORT s_ClientPort = nullptr;
++static PFLT_FILTER s_Filter = nullptr;
++
++NTSTATUS InitFilterPort(
++    _In_ PFLT_FILTER Filter)
++{
++	NTSTATUS status = STATUS_INTERNAL_ERROR;
++
++    do
++    {
++		UNICODE_STRING name = RTL_CONSTANT_STRING(FILTER_PORT_NAME);
++		PSECURITY_DESCRIPTOR sd;
++
++		status = FltBuildDefaultSecurityDescriptor(&sd, FLT_PORT_ALL_ACCESS);
++		if (!NT_SUCCESS(status))
++		{
++			break;
++		}
++
++		OBJECT_ATTRIBUTES attr;
++		InitializeObjectAttributes(&attr, &name, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, nullptr, sd);
++
++		status = FltCreateCommunicationPort(Filter, 
++			&s_Port, 
++			&attr, 
++			nullptr,
++			PortConnectNotify, 
++			PortDisconnectNotify, 
++			PortMessageNotify, 
++			1);
++
++		FltFreeSecurityDescriptor(sd);
++
++		if (!NT_SUCCESS(status))
++		{
++			break;
++		}
++
++		s_Filter = Filter;
++
++    } while (false);
++    
++	return status;
++}
++
++void FinalizeFilterPort()
++{
++	if (s_Port)
++	{
++		FltCloseCommunicationPort(s_Port);
++        s_Port = nullptr;
++	}
++}
++
++// Rudimentary output message sender.
++NTSTATUS SendOutputMessage(_In_ PortMessageType type, _In_ LPCWSTR formatString, ...)
++{
++	NTSTATUS status = STATUS_INTERNAL_ERROR;
++
++	if (s_ClientPort)
++	{
++		va_list args;
++		va_start(args, formatString);
++
++		auto msg = (PortMessage*)ExAllocatePool2(
++			POOL_FLAG_PAGED, 
++			COMMUNICATION_BUFFER_LEN, 
++			COMMUNINCATION_POOLTAG);
++
++		if (msg)
++		{
++			msg->type = type;
++
++			UNICODE_STRING tmpString = { 0, COMMUNICATION_BUFFER_LEN - FIELD_OFFSET(PortMessage, data), reinterpret_cast<wchar_t*>(msg->data) };
++			if (NT_SUCCESS(status = RtlUnicodeStringVPrintf(&tmpString, formatString, args)))
++			{
++				msg->dataLenBytes = tmpString.Length;
++
++				// LARGE_INTEGER timeout;
++				// timeout.QuadPart = -10000 * 100; // 100 msec
++				status = FltSendMessage(s_Filter,
++					&s_ClientPort,
++					msg,
++					msg->dataLenBytes + FIELD_OFFSET(PortMessage, data),
++					nullptr,
++					nullptr,
++					nullptr);
++			}
++
++			ExFreePool(msg);
++		}
++		else
++		{
++			status = STATUS_NO_MEMORY;
++		}
++	}
++
++	return status;
++}
++
++NTSTATUS PortConnectNotify(
++	_In_ PFLT_PORT ClientPort,
++	_In_opt_ PVOID ServerPortCookie,
++	_In_reads_bytes_opt_(SizeOfContext) PVOID ConnectionContext,
++	_In_ ULONG SizeOfContext,
++	_Outptr_result_maybenull_ PVOID* ConnectionPortCookie)
++{
++	UNREFERENCED_PARAMETER(ServerPortCookie);
++	UNREFERENCED_PARAMETER(ConnectionContext);
++	UNREFERENCED_PARAMETER(SizeOfContext);
++	
++	ConnectionPortCookie = nullptr;
++	s_ClientPort = ClientPort;
++
++	return STATUS_SUCCESS;
++}
++
++void PortDisconnectNotify(_In_opt_ PVOID ConnectionCookie) {
++	UNREFERENCED_PARAMETER(ConnectionCookie);
++
++	FltCloseClientPort(s_Filter, &s_ClientPort);
++	s_ClientPort = nullptr;
++}
++
++NTSTATUS PortMessageNotify(
++	_In_opt_ PVOID PortCookie,
++	_In_reads_bytes_opt_(InputBufferLength) PVOID InputBuffer,
++	_In_ ULONG InputBufferLength,
++	_Out_writes_bytes_to_opt_(OutputBufferLength, *ReturnOutputBufferLength) PVOID OutputBuffer,
++	_In_ ULONG OutputBufferLength,
++	_Out_ PULONG ReturnOutputBufferLength)
++{
++	UNREFERENCED_PARAMETER(PortCookie);
++	UNREFERENCED_PARAMETER(InputBuffer);
++	UNREFERENCED_PARAMETER(InputBufferLength);
++	UNREFERENCED_PARAMETER(OutputBuffer);
++	UNREFERENCED_PARAMETER(OutputBufferLength);
++
++	ReturnOutputBufferLength = 0;
++
++	return STATUS_SUCCESS;
++}
+\ No newline at end of file
+diff --git a/driver/Communication.h b/driver/Communication.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..266f4e2b4399c7e5371d2ef1ac03ce711cb520d7
+--- /dev/null
++++ b/driver/Communication.h
+@@ -0,0 +1,26 @@
++#pragma once
++
++NTSTATUS InitFilterPort(
++	_In_ PFLT_FILTER Filter);
++
++void FinalizeFilterPort();
++
++NTSTATUS PortConnectNotify(
++	_In_ PFLT_PORT ClientPort,
++	_In_opt_ PVOID ServerPortCookie,
++	_In_reads_bytes_opt_(SizeOfContext) PVOID ConnectionContext,
++	_In_ ULONG SizeOfContext,
++	_Outptr_result_maybenull_ PVOID* ConnectionPortCookie);
++
++void PortDisconnectNotify(_In_opt_ PVOID ConnectionCookie);
++
++NTSTATUS PortMessageNotify(
++	_In_opt_ PVOID PortCookie,
++	_In_reads_bytes_opt_(InputBufferLength) PVOID InputBuffer,
++	_In_ ULONG InputBufferLength,
++	_Out_writes_bytes_to_opt_(OutputBufferLength, *ReturnOutputBufferLength) PVOID OutputBuffer,
++	_In_ ULONG OutputBufferLength,
++	_Out_ PULONG ReturnOutputBufferLength);
++
++NTSTATUS SendOutputMessage(_In_ PortMessageType type, _In_ LPCWSTR formatString, ...);
++
+diff --git a/driver/Driver.cpp b/driver/Driver.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..808ba9d50bbfe27cebb5e8e1c95ce32f5d0d24e9
+--- /dev/null
++++ b/driver/Driver.cpp
+@@ -0,0 +1,45 @@
++#include "pch.h"
++#include "Driver.h"
++#include "Communication.h"
++
++PFLT_FILTER g_Filter = nullptr;
++
++extern "C"
++NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
++{
++	auto status = InitMiniFilter(DriverObject, RegistryPath);
++
++	if (!NT_SUCCESS(status)) 
++	{
++		KdPrint((DRIVER_PREFIX "Failed to initialize mini-filter (0x%X)\n", status));
++		return status;
++	}
++
++	do {
++		//
++		// Initialize dynamic imports
++		//
++		DynamicImports::Instance();
++
++		//
++		// Set up our filter communication port
++		//
++        if (!NT_SUCCESS(InitFilterPort(g_Filter))) 
++		{
++            KdPrint((DRIVER_PREFIX "Failed to initialize filter port (0x%X)\n", status));
++            break;
++        }
++
++		//
++		//  Start filtering i/o
++		//
++		status = FltStartFiltering(g_Filter);
++	} while (false);
++
++	if (!NT_SUCCESS(status)) 
++	{
++		MinifilterUnload(0);
++	}
++
++	return status;
++}
+diff --git a/driver/Driver.h b/driver/Driver.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c7879d1ace21ad7ab11a056f08d5d091411b75b3
+--- /dev/null
++++ b/driver/Driver.h
+@@ -0,0 +1,8 @@
++#pragma once
++
++extern PFLT_FILTER g_Filter;
++
++#define DRIVER_PREFIX "Backup: "
++
++NTSTATUS InitMiniFilter(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath);
++NTSTATUS MinifilterUnload(FLT_FILTER_UNLOAD_FLAGS Flags);
+diff --git a/driver/FileContext.h b/driver/FileContext.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..7098c1499a019bf54fd775d61b8bfb332a6610f9
+--- /dev/null
++++ b/driver/FileContext.h
+@@ -0,0 +1,47 @@
++#pragma once
++
++//
++// File contexts cover all streams of a file. Not sure how useful this is.
++// 
++class FileContext {
++
++public:
++	Mutex Lock;
++	ULONGLONG m_OpenFOCount = 0;
++
++	FileContext()
++	{
++		Lock.Init();
++	}
++
++	static NTSTATUS Factory(_In_ PCFLT_RELATED_OBJECTS FltObjects, _Out_ FileContext** Context) 
++	{
++		*Context = nullptr;
++
++        auto status = FltAllocateContext(FltObjects->Filter,
++            FLT_FILE_CONTEXT, sizeof(FileContext), PagedPool,
++            (PFLT_CONTEXT*)Context);
++
++		if (!NT_SUCCESS(status)) {
++			return status;
++		}
++
++		// Placement new
++        new (*Context) FileContext();
++
++        return STATUS_SUCCESS;
++	}
++
++	static void Cleanup(_In_ PFLT_CONTEXT Context, _In_ FLT_CONTEXT_TYPE ContextType)
++	{
++        if (ContextType != FLT_FILE_CONTEXT)
++        {
++            ASSERT(FALSE);
++            return;
++        }
++        auto* ctx = reinterpret_cast<FileContext*>(Context);
++		UNREFERENCED_PARAMETER(ctx);
++		return;
++	}
++};
++
+diff --git a/driver/MiniFilter.cpp b/driver/MiniFilter.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..4f63cb984f525814b19a4e211baf91112e660183
+--- /dev/null
++++ b/driver/MiniFilter.cpp
+@@ -0,0 +1,434 @@
++#include "pch.h"
++#include "Driver.h"
++
++#include <ktl.h>
++#include <Locker.h>
++
++#include "pooltag.h"
++#include "Communication.h"
++#include "common.h"
++
++// Contexts
++#include "VolumeContext.h"
++#include "FileContext.h"
++#include "StreamHandleContext.h"
++#include "StreamContext.h"
++#include "DynamicImports.h"
++#include "Process.h"
++
++NTSTATUS MinifilterInstanceSetup(PCFLT_RELATED_OBJECTS FltObjects, FLT_INSTANCE_SETUP_FLAGS Flags, DEVICE_TYPE VolumeDeviceType, FLT_FILESYSTEM_TYPE VolumeFilesystemType) 
++{
++	KdPrint((DRIVER_PREFIX "InstanceSetup FS: %u\n", VolumeFilesystemType));
++
++	UNREFERENCED_PARAMETER(FltObjects);
++	UNREFERENCED_PARAMETER(Flags);
++	UNREFERENCED_PARAMETER(VolumeDeviceType);
++    UNREFERENCED_PARAMETER(VolumeFilesystemType);
++
++	VolumeContext* Context;
++    auto status = VolumeContext::Factory(FltObjects, &Context);
++	if (!NT_SUCCESS(status))
++	{
++        KdPrint((DRIVER_PREFIX "Failed to allocate volume context (0x%08X)\n", status));
++        return STATUS_FLT_DO_NOT_ATTACH;
++	}
++
++	if (!NT_SUCCESS(status = VolumeContext::SetContext(FltObjects, Context, true)))
++	{
++		KdPrint((DRIVER_PREFIX "Failed to set volume context (0x%08X)\n", status));
++	}
++
++	FltReleaseContext(Context);
++
++	return NT_SUCCESS(status) ? STATUS_SUCCESS : STATUS_FLT_DO_NOT_ATTACH;
++}
++
++NTSTATUS MinifilterInstanceQueryTeardown(PCFLT_RELATED_OBJECTS FltObjects, FLT_INSTANCE_QUERY_TEARDOWN_FLAGS Flags) 
++{
++	UNREFERENCED_PARAMETER(FltObjects);
++	UNREFERENCED_PARAMETER(Flags);
++	KdPrint((DRIVER_PREFIX "InstanceQueryTeardown\n"));
++
++	return STATUS_SUCCESS;
++}
++
++VOID MinifilterInstanceTeardownStart(PCFLT_RELATED_OBJECTS FltObjects, FLT_INSTANCE_TEARDOWN_FLAGS Flags) 
++{
++	UNREFERENCED_PARAMETER(FltObjects);
++	UNREFERENCED_PARAMETER(Flags);
++}
++
++VOID MinifilterInstanceTeardownComplete(PCFLT_RELATED_OBJECTS FltObjects, FLT_INSTANCE_TEARDOWN_FLAGS Flags) 
++{
++	UNREFERENCED_PARAMETER(FltObjects);
++	UNREFERENCED_PARAMETER(Flags);
++}
++
++bool IsInterestingFile(FilterFileNameInformation& nameInfo) 
++{
++	if (!NT_SUCCESS(nameInfo.Parse()))
++		return false;
++
++	static PCWSTR extensions[] = {
++		L"test",
++		L"txt",
++	};
++
++	for (auto ext : extensions)
++	{
++		// TODO: We don't need to call wcslen - we have the length!
++		if (nameInfo->Extension.Buffer != nullptr && _wcsnicmp(ext, nameInfo->Extension.Buffer, wcslen(ext)) == 0)
++			return true;
++	}
++
++	return false;
++}
++
++FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data, 
++	_In_ PCFLT_RELATED_OBJECTS FltObjects, 
++	_In_opt_ PVOID, 
++	_In_ FLT_POST_OPERATION_FLAGS Flags) 
++{
++	const ULONG disposition = (Data->Iopb->Parameters.Create.Options >> 24) & 0xff;
++	UNREFERENCED_PARAMETER(disposition); // I always forget how to do this. Keep it around.
++
++	const ULONG desiredAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
++
++	// 
++	// Basic things to ignore 
++	//
++	if (Flags & FLTFL_POST_OPERATION_DRAINING || 
++		Data->IoStatus.Status != STATUS_SUCCESS ||
++		IoGetTopLevelIrp() != nullptr ||
++		Data->RequestorMode == KernelMode)
++	{
++		return FLT_POSTOP_FINISHED_PROCESSING;
++	}
++
++	//
++	// Ignore attribute opens to save a *lot* of useless processing.
++	//
++	if (Data->IoStatus.Information == FILE_OPENED && 
++		((desiredAccess & ~(SYNCHRONIZE | FILE_READ_ATTRIBUTES)) == 0))
++	{
++		return FLT_POSTOP_FINISHED_PROCESSING;
++	}
++
++	//
++	// Ignore directories
++	// 
++	BOOLEAN dir = FALSE;
++	if (!NT_SUCCESS(FltIsDirectory(FltObjects->FileObject, FltObjects->Instance, &dir)))
++	{
++		return FLT_POSTOP_FINISHED_PROCESSING;
++	}
++
++	if (dir) {
++		//
++		// not interesting
++		//
++		return FLT_POSTOP_FINISHED_PROCESSING;
++	}
++
++	FilterFileNameInformation fileNameInfo(Data);
++	if (!fileNameInfo) {
++		return FLT_POSTOP_FINISHED_PROCESSING;
++	}
++
++    if (!IsInterestingFile(fileNameInfo))
++    {
++        return FLT_POSTOP_FINISHED_PROCESSING;
++    }
++
++	//
++	// allocate context
++	//
++	StreamHandleContext* context;
++    auto status = StreamHandleContext::Factory(FltObjects, &context);
++	if (!NT_SUCCESS(status)) {
++		KdPrint(("Failed to allocate stream handle context (0x%08X)\n", status));
++		return FLT_POSTOP_FINISHED_PROCESSING;
++	}
++
++	//
++	// set stream context
++	//
++	if (!NT_SUCCESS(status = StreamHandleContext::SetContext(FltObjects, context, true)))
++	{
++		KdPrint(("Failed to set file context (0x%08X)\n", status));
++	}
++	else
++	{
++		UnicodeString processName;
++		Process p(PsGetCurrentProcess());
++		if (!NT_SUCCESS(status = p.GetImageFileNameOnly(processName)))
++		{
++			processName.Copy(Process::GetUnknownProcessName());
++		}
++
++		SendOutputMessage(PortMessageType::FileMessage,L"%wZ: Created SH context 0x%p for %wZ", 
++			processName.Get(), context, &fileNameInfo->Name);
++	}
++
++	//
++	// release context in all cases
++	//
++	FltReleaseContext(context);
++
++	return FLT_POSTOP_FINISHED_PROCESSING;
++}
++
++FLT_PREOP_CALLBACK_STATUS OnPreWrite(
++	_Inout_ PFLT_CALLBACK_DATA Data,
++	_In_ PCFLT_RELATED_OBJECTS FltObjects,
++	_Outptr_result_maybenull_ PVOID* CompletionContext) 
++{
++	const auto& Parameters = Data->Iopb->Parameters.Write;
++	CompletionContext = nullptr;
++
++	if (IoGetTopLevelIrp() != nullptr)
++	{
++		return FLT_PREOP_SUCCESS_NO_CALLBACK;
++	}
++
++	//
++	// This may not exist
++	//
++	StreamHandleContext* context;
++
++	auto status = FltGetStreamHandleContext(FltObjects->Instance,
++		FltObjects->FileObject,
++		(PFLT_CONTEXT*)&context);
++
++	if (!NT_SUCCESS(status) || context == nullptr) {
++		//
++		// no context, continue normally
++		//
++		return FLT_PREOP_SUCCESS_NO_CALLBACK;	
++	}
++
++	do {
++
++		FilterFileNameInformation name(Data);
++		if (!name)
++		{
++			break;
++		}
++
++		COPY_INFORMATION copyInfo = {};
++		status = DynamicImports::Instance()->FltGetCopyInformationFromCallbackData(Data, &copyInfo);
++		if (NT_SUCCESS(status))
++		{
++			// TODO: We should be able to figure out the instance for the source without that much trouble.
++			FilterFileNameInformation sourceName (nullptr, copyInfo.SourceFileObject);
++
++			// This is always SYSTEM it seems.
++			SendOutputMessage(PortMessageType::FileMessage, L"Copy Notification (pos=%u, len=%u)\n\tDestination: %wZ (SH=%p)",
++				Parameters.ByteOffset, Parameters.Length, &name->Name, context);
++
++			if (sourceName)
++			{
++				SendOutputMessage(PortMessageType::FileMessage, L"\tSource: %wZ", &sourceName.Get()->Name);
++			}
++			else
++			{
++				SendOutputMessage(PortMessageType::FileMessage, L"\tSource: %p", copyInfo.SourceFileObject);
++			}
++		}
++
++		Locker locker(context->Lock);
++		if (context->m_writeCount)
++		{
++			//
++			// already written, nothing to do
++			//
++			break;
++		}
++		KeQuerySystemTimePrecise(&context->m_firstWriteTime);
++		SendOutputMessage(PortMessageType::FileMessage, L"Saw first write to %wZ", &name->Name);
++		context->m_writeCount++;
++	} while (false);
++
++	FltReleaseContext(context);
++
++	//
++	// don't prevent the write regardless
++	//
++	return FLT_PREOP_SUCCESS_NO_CALLBACK;
++}
++
++FLT_POSTOP_CALLBACK_STATUS OnPostCleanup(_Inout_ PFLT_CALLBACK_DATA Data, 
++	_In_ PCFLT_RELATED_OBJECTS FltObjects, 
++	_In_opt_ PVOID, 
++	_In_ FLT_POST_OPERATION_FLAGS Flags) 
++{
++	UNREFERENCED_PARAMETER(Flags);
++	UNREFERENCED_PARAMETER(Data);
++
++	StreamHandleContext* context;
++
++	auto status = FltGetStreamHandleContext(FltObjects->Instance, FltObjects->FileObject, (PFLT_CONTEXT*)&context);
++	if (!NT_SUCCESS(status) || context == nullptr) {
++		//
++		// no context, continue normally
++		//
++		return FLT_POSTOP_FINISHED_PROCESSING;
++	}
++
++	// SendOutputMessage(PortMessageType::FileMessage, L"Cleaning up stream handle context 0x%p", context);
++	FltReleaseContext(context);
++	FltDeleteContext(context);
++
++	return FLT_POSTOP_FINISHED_PROCESSING;
++}
++
++FLT_PREOP_CALLBACK_STATUS OnPreClose(
++	_Inout_ PFLT_CALLBACK_DATA Data,
++	_In_ PCFLT_RELATED_OBJECTS FltObjects,
++	_Outptr_result_maybenull_ PVOID* CompletionContext)
++{
++	UNREFERENCED_PARAMETER(Data);
++	UNREFERENCED_PARAMETER(FltObjects);
++	*CompletionContext = nullptr;	
++
++	return FLT_PREOP_SUCCESS_NO_CALLBACK;
++}
++
++NTSTATUS InitMiniFilter(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
++{
++	HANDLE hKey = nullptr;
++	HANDLE hSubKey = nullptr;
++	NTSTATUS status;
++	do 
++	{
++		//
++		// add registry data for proper mini-filter registration
++		//
++		OBJECT_ATTRIBUTES keyAttr = RTL_CONSTANT_OBJECT_ATTRIBUTES(RegistryPath, OBJ_KERNEL_HANDLE);
++		status = ZwOpenKey(&hKey, KEY_WRITE, &keyAttr);
++		if (!NT_SUCCESS(status))
++		{
++			break;
++		}
++
++		UNICODE_STRING subKey = RTL_CONSTANT_STRING(L"Instances");
++		OBJECT_ATTRIBUTES subKeyAttr;
++		InitializeObjectAttributes(&subKeyAttr, &subKey, OBJ_KERNEL_HANDLE, hKey, nullptr);
++		status = ZwCreateKey(&hSubKey, KEY_WRITE, &subKeyAttr, 0, nullptr, 0, nullptr);
++		if (!NT_SUCCESS(status))
++		{
++			break;
++		}
++
++		//
++		// set "DefaultInstance" value
++		//
++		UNICODE_STRING valueName = RTL_CONSTANT_STRING(L"DefaultInstance");
++		WCHAR name[] = L"BackupDefaultInstance";
++		status = ZwSetValueKey(hSubKey, &valueName, 0, REG_SZ, name, sizeof(name));
++		if (!NT_SUCCESS(status))
++		{
++			break;
++		}
++
++		//
++		// create "instance" key under "Instances"
++		//
++		UNICODE_STRING instKeyName;
++		RtlInitUnicodeString(&instKeyName, name);
++		HANDLE hInstKey;
++		InitializeObjectAttributes(&subKeyAttr, &instKeyName, OBJ_KERNEL_HANDLE, hSubKey, nullptr);
++		status = ZwCreateKey(&hInstKey, KEY_WRITE, &subKeyAttr, 0, nullptr, 0, nullptr);
++		if (!NT_SUCCESS(status))
++		{
++			break;
++		}
++
++		//
++		// write out altitude 
++		// TODO: Don't overwrite this if it exists
++		// 
++		WCHAR altitude[] = L"335342";
++		UNICODE_STRING altitudeName = RTL_CONSTANT_STRING(L"Altitude");
++		status = ZwSetValueKey(hInstKey, &altitudeName, 0, REG_SZ, altitude, sizeof(altitude));
++		if (!NT_SUCCESS(status))
++		{
++			break;
++		}
++
++		//
++		// write out flags
++		//
++		UNICODE_STRING flagsName = RTL_CONSTANT_STRING(L"Flags");
++		ULONG flags = 0;
++		status = ZwSetValueKey(hInstKey, &flagsName, 0, REG_DWORD, &flags, sizeof(flags));
++		if (!NT_SUCCESS(status))
++		{
++			break;
++		}
++	
++		ZwClose(hInstKey);
++        hInstKey = nullptr;
++
++        ZwClose(hSubKey);
++        hSubKey = nullptr;
++
++		FLT_OPERATION_REGISTRATION const callbacks[] = {
++			{ IRP_MJ_CREATE, 0, nullptr, OnPostCreate },
++			{ IRP_MJ_WRITE, 0, OnPreWrite },
++			{ IRP_MJ_CLEANUP, 0, nullptr, OnPostCleanup },
++			{ IRP_MJ_CLOSE, 0, OnPreClose, nullptr },
++			{ IRP_MJ_OPERATION_END }
++		};
++
++		const FLT_CONTEXT_REGISTRATION context[] = {
++			{ FLT_FILE_CONTEXT, 0, FileContext::Cleanup, sizeof(FileContext), FILE_POOLTAG },
++			{ FLT_VOLUME_CONTEXT, 0, VolumeContext::Cleanup, sizeof(VolumeContext), VOLUME_POOLTAG },
++            { FLT_STREAMHANDLE_CONTEXT, 0, StreamHandleContext::Cleanup, sizeof(StreamHandleContext) , STREAMHANDLE_POOLTAG },
++            { FLT_STREAM_CONTEXT, 0, StreamContext::Cleanup, sizeof(StreamContext), STREAM_POOLTAG },
++			{ FLT_CONTEXT_END }
++		};
++
++		FLT_REGISTRATION const reg = {
++			sizeof(FLT_REGISTRATION),
++			FLT_REGISTRATION_VERSION,
++			0,                       //  Flags
++			context,                 //  Context
++			callbacks,               //  Operation callbacks
++			MinifilterUnload,                   //  MiniFilterUnload
++			MinifilterInstanceSetup,            //  InstanceSetup
++			MinifilterInstanceQueryTeardown,    //  InstanceQueryTeardown
++			MinifilterInstanceTeardownStart,    //  InstanceTeardownStart
++			MinifilterInstanceTeardownComplete, //  InstanceTeardownComplete
++		};
++		status = FltRegisterFilter(DriverObject, &reg, &g_Filter);
++	} while (false);
++
++	if (hSubKey)
++	{
++		if (!NT_SUCCESS(status))
++		{
++			ZwDeleteKey(hSubKey);
++		}
++		ZwClose(hSubKey);
++		hSubKey = nullptr;
++	}
++
++	if (hKey)
++	{
++		ZwClose(hKey);
++		hKey = nullptr;
++	}
++
++	return status;
++}
++
++NTSTATUS MinifilterUnload(FLT_FILTER_UNLOAD_FLAGS Flags)
++{
++	UNREFERENCED_PARAMETER(Flags);
++
++	FinalizeFilterPort();
++	FltUnregisterFilter(g_Filter);
++
++	return STATUS_SUCCESS;
++}
+\ No newline at end of file
+diff --git a/driver/StreamContext.h b/driver/StreamContext.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..a13c162416b31b80a60189778a1e22e34dc00df3
+--- /dev/null
++++ b/driver/StreamContext.h
+@@ -0,0 +1,50 @@
++#pragma once
++
++//
++// File contexts cover all streams of a file.
++//
++class StreamContext {
++
++public:
++	Mutex Lock;
++	ULONGLONG m_OpenFOCount = 0;
++
++	StreamContext()
++	{
++		Lock.Init();
++	}
++
++	static NTSTATUS Factory(_In_ PCFLT_RELATED_OBJECTS FltObjects, _Out_ StreamContext** Context)
++	{
++		*Context = nullptr;
++
++		auto status = FltAllocateContext(FltObjects->Filter,
++			FLT_STREAM_CONTEXT, sizeof(StreamContext), PagedPool,
++			(PFLT_CONTEXT*)Context);
++
++		if (!NT_SUCCESS(status)) {
++			return status;
++		}
++
++		// Placement new
++		new (*Context) StreamContext();
++
++		return STATUS_SUCCESS;
++	}
++
++	// This is essentially our destructor, called by Filter Manager when the context is deleted
++	static void Cleanup(_In_ PFLT_CONTEXT Context, _In_ FLT_CONTEXT_TYPE ContextType)
++	{
++		if (ContextType != FLT_STREAM_CONTEXT)
++		{
++			ASSERT(FALSE);
++			return;
++		}
++        auto ctx = reinterpret_cast<StreamContext*>(Context);
++		UNREFERENCED_PARAMETER(ctx);
++		return;
++	}
++
++};
++
++
+diff --git a/driver/StreamHandleContext.h b/driver/StreamHandleContext.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..afe1b129fa886de28770cfe612f9412dddde439e
+--- /dev/null
++++ b/driver/StreamHandleContext.h
+@@ -0,0 +1,63 @@
++#pragma once
++
++class StreamHandleContext {
++
++public:
++    LARGE_INTEGER m_firstWriteTime = {};
++    ULONGLONG m_writeCount = {};
++    Mutex Lock;
++
++    StreamHandleContext()
++    {
++        Lock.Init();
++    }
++
++    static NTSTATUS Factory(_In_ PCFLT_RELATED_OBJECTS FltObjects, _Out_ StreamHandleContext** Context)
++    {
++        *Context = nullptr;
++
++        auto status = FltAllocateContext(FltObjects->Filter,
++            FLT_STREAMHANDLE_CONTEXT, sizeof(StreamHandleContext), NonPagedPool, // Mutex must be non-paged
++            (PFLT_CONTEXT*)Context);
++
++        if (!NT_SUCCESS(status)) {
++            return status;
++        }
++
++        // Placement new
++        new (*Context) StreamHandleContext();
++
++        return STATUS_SUCCESS;
++    }
++
++    static NTSTATUS SetContext(PCFLT_RELATED_OBJECTS FltObjects, StreamHandleContext* Context, bool Replace)
++    {
++        StreamHandleContext* OldContext = nullptr;
++
++        auto status = FltSetStreamHandleContext(FltObjects->Instance,
++            FltObjects->FileObject,
++            Replace ?  FLT_SET_CONTEXT_REPLACE_IF_EXISTS : FLT_SET_CONTEXT_KEEP_IF_EXISTS,
++            Context,
++            reinterpret_cast<PFLT_CONTEXT*>(&OldContext));
++
++        if (OldContext)
++        {
++            FltReleaseContext(OldContext);
++        }
++
++        return status;
++    }
++
++    // This is essentially our destructor, called by Filter Manager when the context is deleted
++    static void Cleanup(_In_ PFLT_CONTEXT Context, _In_ FLT_CONTEXT_TYPE ContextType)
++    {
++        if (ContextType != FLT_STREAMHANDLE_CONTEXT)
++        {
++            ASSERT(FALSE);
++            return;
++        }
++        auto ctx = reinterpret_cast<StreamHandleContext*>(Context);
++        UNREFERENCED_PARAMETER(ctx);
++        return;
++    }
++};
+\ No newline at end of file
+diff --git a/driver/VolumeContext.h b/driver/VolumeContext.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..db708e284d1b9b1953c3c24c5c2476786d8c9f26
+--- /dev/null
++++ b/driver/VolumeContext.h
+@@ -0,0 +1,177 @@
++#pragma once
++
++class VolumeContext {
++
++public:
++
++	UNICODE_STRING volumeName = {};
++    PFLT_VOLUME_PROPERTIES volumeProperties = {};
++
++	VolumeContext()
++	{
++
++	}
++
++    static NTSTATUS Factory(_In_ PCFLT_RELATED_OBJECTS FltObjects, _Out_ VolumeContext** Context)
++    {
++        *Context = nullptr;
++
++        auto status = FltAllocateContext(FltObjects->Filter,
++            FLT_VOLUME_CONTEXT, 
++			sizeof(VolumeContext), 
++			PagedPool,
++            (PFLT_CONTEXT*)Context);
++
++        if (!NT_SUCCESS(status)) {
++            return status;
++        }
++
++        // Placement new
++        new (*Context) VolumeContext();
++
++		// Do this outside of constructor so that we can return status
++        if (!NT_SUCCESS(status = (*Context)->GetVolumeName(FltObjects->Volume, (*Context)->volumeName))) {
++            FltReleaseContext(*Context);
++            *Context = nullptr;
++            return status;
++        }
++
++        if (!NT_SUCCESS(status = (*Context)->GetVolumeProperties(FltObjects->Volume, &(*Context)->volumeProperties))) {
++            FltReleaseContext(*Context);
++            *Context = nullptr;
++            return status;
++        }
++        
++		return STATUS_SUCCESS;
++    }
++
++	static NTSTATUS SetContext(PCFLT_RELATED_OBJECTS FltObjects, VolumeContext* Context, bool Replace)
++	{
++		VolumeContext* OldContext = nullptr;
++
++		auto status = FltSetVolumeContext(FltObjects->Volume,
++			Replace ? FLT_SET_CONTEXT_REPLACE_IF_EXISTS : FLT_SET_CONTEXT_KEEP_IF_EXISTS,
++			Context,
++			reinterpret_cast<PFLT_CONTEXT*>(&OldContext));
++
++		if (OldContext)
++		{
++			FltReleaseContext(OldContext);
++		}
++
++		return status;
++	}
++
++	// This is essentially our destructor, called by Filter Manager when the context is deleted
++    static void Cleanup(_In_ PFLT_CONTEXT Context, _In_ FLT_CONTEXT_TYPE ContextType)
++    {
++        if (ContextType != FLT_VOLUME_CONTEXT)
++        {
++            ASSERT(FALSE);
++            return;
++        }
++
++        auto ctx = reinterpret_cast<VolumeContext*>(Context);
++        if (ctx->volumeName.Buffer)
++        {
++            ExFreePoolWithTag(ctx->volumeName.Buffer, VOLUME_POOLTAG);
++            ctx->volumeName.Buffer = nullptr;
++        }
++
++		if (ctx->volumeProperties)
++		{
++			ExFreePoolWithTag(ctx->volumeProperties, VOLUME_POOLTAG);
++			ctx->volumeProperties = nullptr;
++		}
++
++        return;
++    }
++
++private:
++
++	NTSTATUS GetVolumeName(_In_ PFLT_VOLUME Volume, _Out_ UNICODE_STRING& VolumeName)
++	{
++		auto status = STATUS_SUCCESS;
++		VolumeName = { 0 };
++
++		// Get the volume name
++		do
++		{
++			// Step 1: First call to FltGetVolumeName to determine the required buffer size.
++			// We expect STATUS_BUFFER_TOO_SMALL, and returnedLength will be updated.
++			ULONG returnedLength = 0;
++			status = FltGetVolumeName(
++				Volume,
++				NULL, // No buffer provided
++				&returnedLength
++			);
++
++			// We expect STATUS_BUFFER_TOO_SMALL here. If it's another error, get out.
++			if (status != STATUS_BUFFER_TOO_SMALL) {
++				SendOutputMessage(PortMessageType::VolumeMessage, L"FltGetVolumeName (first call) failed with unexpected status: 0x%X\n", status);
++				break;
++			}
++
++			volumeName.Buffer = (wchar_t*)ExAllocatePool2(POOL_FLAG_NON_PAGED, returnedLength, VOLUME_POOLTAG);
++			if (!volumeName.Buffer) {
++				break;
++			}
++			volumeName.MaximumLength = static_cast<USHORT>(returnedLength);
++
++			// Step 2. Get the name
++			status = FltGetVolumeName(Volume,
++				&volumeName,
++				nullptr);
++
++			if (!NT_SUCCESS(status)) {
++				SendOutputMessage(PortMessageType::VolumeMessage, L"FltGetVolumeName failed with status: 0x%X\n", status);
++				break;
++			}
++
++		} while (false);
++
++		if (!NT_SUCCESS(status)) {
++			if (volumeName.Buffer) {
++				ExFreePoolWithTag(volumeName.Buffer, VOLUME_POOLTAG);
++				volumeName.Buffer = nullptr;
++			}
++		}
++
++		return status;
++	}
++
++	NTSTATUS GetVolumeProperties(_In_ PFLT_VOLUME Volume, _Out_ PFLT_VOLUME_PROPERTIES* Properties)
++	{
++		*Properties = nullptr;
++
++        ULONG returnedLength = 0;
++        auto status = FltGetVolumeProperties(Volume, 
++			nullptr,
++			0,
++			&returnedLength);
++
++        if (status != STATUS_BUFFER_TOO_SMALL) {
++            return status;
++        }
++
++		*Properties = (PFLT_VOLUME_PROPERTIES)ExAllocatePool2(POOL_FLAG_NON_PAGED, returnedLength, VOLUME_POOLTAG);
++
++		if (nullptr == *Properties)
++		{
++			return STATUS_INSUFFICIENT_RESOURCES;
++		}
++
++        status = FltGetVolumeProperties(Volume,
++            *Properties,
++            returnedLength,
++            &returnedLength);       
++
++		if (!NT_SUCCESS(status))
++		{
++			ExFreePoolWithTag(*Properties, VOLUME_POOLTAG);
++			*Properties = nullptr;
++		}
++
++		return status;
++	}
++};
+\ No newline at end of file
+diff --git a/driver/pch.cpp b/driver/pch.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d9f38c57d63f197d552a5283424f75f885bb1c2
+--- /dev/null
++++ b/driver/pch.cpp
+@@ -0,0 +1 @@
++#include "pch.h"
+diff --git a/driver/pch.h b/driver/pch.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ba8be785688719fd43f423b34e8eacef2d2c84f
+--- /dev/null
++++ b/driver/pch.h
+@@ -0,0 +1,7 @@
++#pragma once
++
++#include <fltKernel.h>
++#include <Ntstrsafe.h>
++
++#include "Common.h"
++#include "DynamicImports.h"
+diff --git a/driver/pooltag.h b/driver/pooltag.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..bfb804a51ddebae491a5a961dc45077abfc5ff48
+--- /dev/null
++++ b/driver/pooltag.h
+@@ -0,0 +1,7 @@
++#pragma once
++
++#define COMMUNINCATION_POOLTAG 'mcAA'
++#define VOLUME_POOLTAG 'mvAA'
++#define FILE_POOLTAG 'ifAA'
++#define STREAMHANDLE_POOLTAG 'hsAA'
++#define STREAM_POOLTAG 'tsAA'
+
+From 9e7073ee37e87d8843728e4d539543361ae62e9c Mon Sep 17 00:00:00 2001
+From: aallidin <aallidin@cisco.com>
+Date: Fri, 29 Aug 2025 08:29:20 -0400
+Subject: [PATCH] Port changes.
+
+---
+ driver/Common.h | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/driver/Common.h b/driver/Common.h
+index 1bcafca21094701dda7cfae74aeb91fc61935016..23d94137c0bb1b4f9dac52bffd00ec260573200b 100644
+--- a/driver/Common.h
++++ b/driver/Common.h
+@@ -12,6 +12,6 @@ struct PortMessage {
+     UCHAR data[1]; // Variable length data follows
+ };
+ 
+-#define FILTER_PORT_NAME L"\\BackupPort"
++#define FILTER_PORT_NAME L"\\CopyDetectPort"
+ 
+-constexpr ULONG COMMUNICATION_BUFFER_LEN = 1 << 12; // 4 KB
++constexpr ULONG COMMUNICATION_BUFFER_LEN = 1 << 15; // 32 KB
+
+From a5d5806036eec94fea3e77f806bf1cabe7e43d67 Mon Sep 17 00:00:00 2001
+From: aallidin <aallidin@cisco.com>
+Date: Tue, 2 Sep 2025 14:49:11 -0400
+Subject: [PATCH] Add checking for copy source / destination flags.
+
+---
+ driver/MiniFilter.cpp | 68 +++++++++++++++++++++------------------------------
+ 1 file changed, 28 insertions(+), 40 deletions(-)
+
+diff --git a/driver/MiniFilter.cpp b/driver/MiniFilter.cpp
+index 4f63cb984f525814b19a4e211baf91112e660183..0358f27495bb953338c0989cb2c96f93f7161fe5 100644
+--- a/driver/MiniFilter.cpp
++++ b/driver/MiniFilter.cpp
+@@ -64,26 +64,6 @@ VOID MinifilterInstanceTeardownComplete(PCFLT_RELATED_OBJECTS FltObjects, FLT_IN
+ 	UNREFERENCED_PARAMETER(Flags);
+ }
+ 
+-bool IsInterestingFile(FilterFileNameInformation& nameInfo) 
+-{
+-	if (!NT_SUCCESS(nameInfo.Parse()))
+-		return false;
+-
+-	static PCWSTR extensions[] = {
+-		L"test",
+-		L"txt",
+-	};
+-
+-	for (auto ext : extensions)
+-	{
+-		// TODO: We don't need to call wcslen - we have the length!
+-		if (nameInfo->Extension.Buffer != nullptr && _wcsnicmp(ext, nameInfo->Extension.Buffer, wcslen(ext)) == 0)
+-			return true;
+-	}
+-
+-	return false;
+-}
+-
+ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data, 
+ 	_In_ PCFLT_RELATED_OBJECTS FltObjects, 
+ 	_In_opt_ PVOID, 
+@@ -130,16 +110,18 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 		return FLT_POSTOP_FINISHED_PROCESSING;
+ 	}
+ 
++	// We only care about copying in this POC.
++	if (!DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopyDestination(FltObjects->FileObject) &&
++		!DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopySource(FltObjects->FileObject))
++	{
++		return FLT_POSTOP_FINISHED_PROCESSING;
++	}
++
+ 	FilterFileNameInformation fileNameInfo(Data);
+ 	if (!fileNameInfo) {
+ 		return FLT_POSTOP_FINISHED_PROCESSING;
+ 	}
+ 
+-    if (!IsInterestingFile(fileNameInfo))
+-    {
+-        return FLT_POSTOP_FINISHED_PROCESSING;
+-    }
+-
+ 	//
+ 	// allocate context
+ 	//
+@@ -161,13 +143,18 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 	{
+ 		UnicodeString processName;
+ 		Process p(PsGetCurrentProcess());
+-		if (!NT_SUCCESS(status = p.GetImageFileNameOnly(processName)))
++		p.GetImageFileNameOnly(processName);
++
++		SendOutputMessage(PortMessageType::FileMessage,L"%wZ (%u): Created SH context 0x%p for %wZ", 
++			processName.Get(), HandleToUlong(PsGetCurrentProcessId()), context, &fileNameInfo->Name);
++		if (DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopyDestination(FltObjects->FileObject))
+ 		{
+-			processName.Copy(Process::GetUnknownProcessName());
++			SendOutputMessage(PortMessageType::FileMessage, L"\tOpened with copy destination flag");
++		}
++		if (DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopySource(FltObjects->FileObject))
++		{
++			SendOutputMessage(PortMessageType::FileMessage, L"\tOpened with copy source flag");
+ 		}
+-
+-		SendOutputMessage(PortMessageType::FileMessage,L"%wZ: Created SH context 0x%p for %wZ", 
+-			processName.Get(), context, &fileNameInfo->Name);
+ 	}
+ 
+ 	//
+@@ -222,9 +209,13 @@ FLT_PREOP_CALLBACK_STATUS OnPreWrite(
+ 			// TODO: We should be able to figure out the instance for the source without that much trouble.
+ 			FilterFileNameInformation sourceName (nullptr, copyInfo.SourceFileObject);
+ 
++			UnicodeString processName;
++			Process p(PsGetCurrentProcess());
++			p.GetImageFileNameOnly(processName);
++
+ 			// This is always SYSTEM it seems.
+-			SendOutputMessage(PortMessageType::FileMessage, L"Copy Notification (pos=%u, len=%u)\n\tDestination: %wZ (SH=%p)",
+-				Parameters.ByteOffset, Parameters.Length, &name->Name, context);
++			SendOutputMessage(PortMessageType::FileMessage, L"%wZ (%u): Copy Notification (pos=%u, len=%u)\n\tDestination: %wZ (SH=%p)",
++				&processName, HandleToULong(PsGetCurrentProcessId()), Parameters.ByteOffset, Parameters.Length, &name->Name, context);
+ 
+ 			if (sourceName)
+ 			{
+@@ -237,16 +228,13 @@ FLT_PREOP_CALLBACK_STATUS OnPreWrite(
+ 		}
+ 
+ 		Locker locker(context->Lock);
+-		if (context->m_writeCount)
++		context->m_writeCount++;
++
++		if (context->m_writeCount == 1)
+ 		{
+-			//
+-			// already written, nothing to do
+-			//
+-			break;
++			// First write
++			KeQuerySystemTimePrecise(&context->m_firstWriteTime);
+ 		}
+-		KeQuerySystemTimePrecise(&context->m_firstWriteTime);
+-		SendOutputMessage(PortMessageType::FileMessage, L"Saw first write to %wZ", &name->Name);
+-		context->m_writeCount++;
+ 	} while (false);
+ 
+ 	FltReleaseContext(context);
+
+From 66f68afa23b5cfceb20ed9efaf2678e9d6606c8e Mon Sep 17 00:00:00 2001
+From: aallidin <aallidin@cisco.com>
+Date: Tue, 2 Sep 2025 15:04:12 -0400
+Subject: [PATCH] Fix output race.
+
+---
+ driver/MiniFilter.cpp | 18 +++++++-----------
+ 1 file changed, 7 insertions(+), 11 deletions(-)
+
+diff --git a/driver/MiniFilter.cpp b/driver/MiniFilter.cpp
+index 0358f27495bb953338c0989cb2c96f93f7161fe5..baf92c21894c0b1a06a066792d61be05f05fce1e 100644
+--- a/driver/MiniFilter.cpp
++++ b/driver/MiniFilter.cpp
+@@ -214,17 +214,13 @@ FLT_PREOP_CALLBACK_STATUS OnPreWrite(
+ 			p.GetImageFileNameOnly(processName);
+ 
+ 			// This is always SYSTEM it seems.
+-			SendOutputMessage(PortMessageType::FileMessage, L"%wZ (%u): Copy Notification (pos=%u, len=%u)\n\tDestination: %wZ (SH=%p)",
+-				&processName, HandleToULong(PsGetCurrentProcessId()), Parameters.ByteOffset, Parameters.Length, &name->Name, context);
+-
+-			if (sourceName)
+-			{
+-				SendOutputMessage(PortMessageType::FileMessage, L"\tSource: %wZ", &sourceName.Get()->Name);
+-			}
+-			else
+-			{
+-				SendOutputMessage(PortMessageType::FileMessage, L"\tSource: %p", copyInfo.SourceFileObject);
+-			}
++			SendOutputMessage(PortMessageType::FileMessage, 
++				L"%wZ (%u): Copy Notification (pos=%u, len=%u)\n\tDestination: %wZ (SH=%p)\n\tSource: %wZ",
++				&processName, HandleToULong(PsGetCurrentProcessId()), 
++				Parameters.ByteOffset, Parameters.Length, 
++				&name->Name, 
++				context,
++				sourceName ? &sourceName.Get()->Name : Process::GetUnknownProcessName());
+ 		}
+ 
+ 		Locker locker(context->Lock);
+
+From 459c7b1efb7d41f4dccc09023d4b8a9cd565234c Mon Sep 17 00:00:00 2001
+From: aallidin <aallidin@cisco.com>
+Date: Wed, 3 Sep 2025 21:19:41 -0400
+Subject: [PATCH] - Refactor communication port to be a class. Start storing
+ the connecting process, and filter it out. - Store the instance in the volume
+ context, since we'll need it for some fun things coming up.
+
+---
+ driver/Communication.cpp |  42 +++++++++----------
+ driver/Communication.h   |  59 ++++++++++++++++++--------
+ driver/Driver.cpp        |   2 +-
+ driver/MiniFilter.cpp    | 107 ++++++++++++++++++++++++++++-------------------
+ driver/VolumeContext.h   |  22 +++++++++-
+ 5 files changed, 147 insertions(+), 85 deletions(-)
+
+diff --git a/driver/Communication.cpp b/driver/Communication.cpp
+index 11394b7a899546955a246909c6575086015a56b1..4b2c72b5fbbcc4622e98bb27ca0ca6aa18592e04 100644
+--- a/driver/Communication.cpp
++++ b/driver/Communication.cpp
+@@ -3,11 +3,7 @@
+ #include "Communication.h"
+ #include "pooltag.h"
+ 
+-static PFLT_PORT s_Port = nullptr;
+-static PFLT_PORT s_ClientPort = nullptr;
+-static PFLT_FILTER s_Filter = nullptr;
+-
+-NTSTATUS InitFilterPort(
++NTSTATUS CommunicationPort::InitFilterPort(
+     _In_ PFLT_FILTER Filter)
+ {
+ 	NTSTATUS status = STATUS_INTERNAL_ERROR;
+@@ -27,7 +23,7 @@ NTSTATUS InitFilterPort(
+ 		InitializeObjectAttributes(&attr, &name, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, nullptr, sd);
+ 
+ 		status = FltCreateCommunicationPort(Filter, 
+-			&s_Port, 
++			&Instance()->m_Port, 
+ 			&attr, 
+ 			nullptr,
+ 			PortConnectNotify, 
+@@ -42,28 +38,28 @@ NTSTATUS InitFilterPort(
+ 			break;
+ 		}
+ 
+-		s_Filter = Filter;
++		Instance()->m_Filter = Filter;
+ 
+     } while (false);
+     
+ 	return status;
+ }
+ 
+-void FinalizeFilterPort()
++void CommunicationPort::FinalizeFilterPort()
+ {
+-	if (s_Port)
++	if (m_Port)
+ 	{
+-		FltCloseCommunicationPort(s_Port);
+-        s_Port = nullptr;
++		FltCloseCommunicationPort(m_Port);
++        m_Port = nullptr;
+ 	}
+ }
+ 
+ // Rudimentary output message sender.
+-NTSTATUS SendOutputMessage(_In_ PortMessageType type, _In_ LPCWSTR formatString, ...)
++NTSTATUS CommunicationPort::SendOutputMessage(_In_ PortMessageType type, _In_ LPCWSTR formatString, ...)
+ {
+ 	NTSTATUS status = STATUS_INTERNAL_ERROR;
+ 
+-	if (s_ClientPort)
++	if (m_ClientPort)
+ 	{
+ 		va_list args;
+ 		va_start(args, formatString);
+@@ -84,8 +80,8 @@ NTSTATUS SendOutputMessage(_In_ PortMessageType type, _In_ LPCWSTR formatString,
+ 
+ 				// LARGE_INTEGER timeout;
+ 				// timeout.QuadPart = -10000 * 100; // 100 msec
+-				status = FltSendMessage(s_Filter,
+-					&s_ClientPort,
++				status = FltSendMessage(m_Filter,
++					&m_ClientPort,
+ 					msg,
+ 					msg->dataLenBytes + FIELD_OFFSET(PortMessage, data),
+ 					nullptr,
+@@ -104,7 +100,7 @@ NTSTATUS SendOutputMessage(_In_ PortMessageType type, _In_ LPCWSTR formatString,
+ 	return status;
+ }
+ 
+-NTSTATUS PortConnectNotify(
++NTSTATUS CommunicationPort::PortConnectNotify(
+ 	_In_ PFLT_PORT ClientPort,
+ 	_In_opt_ PVOID ServerPortCookie,
+ 	_In_reads_bytes_opt_(SizeOfContext) PVOID ConnectionContext,
+@@ -116,19 +112,23 @@ NTSTATUS PortConnectNotify(
+ 	UNREFERENCED_PARAMETER(SizeOfContext);
+ 	
+ 	ConnectionPortCookie = nullptr;
+-	s_ClientPort = ClientPort;
++	Instance()->m_ClientPort = ClientPort;
++    Instance()->m_ConnectedProcess = PsGetCurrentProcess();
++    Instance()->m_ConnectedPID = HandleToUlong(PsGetCurrentProcessId());
+ 
+ 	return STATUS_SUCCESS;
+ }
+ 
+-void PortDisconnectNotify(_In_opt_ PVOID ConnectionCookie) {
++void CommunicationPort::PortDisconnectNotify(_In_opt_ PVOID ConnectionCookie) {
+ 	UNREFERENCED_PARAMETER(ConnectionCookie);
+ 
+-	FltCloseClientPort(s_Filter, &s_ClientPort);
+-	s_ClientPort = nullptr;
++	FltCloseClientPort(Instance()->m_Filter, &Instance()->m_ClientPort);
++	Instance()->m_ClientPort = {};
++	Instance()->m_ConnectedPID = {};
++	Instance()->m_ConnectedProcess = {};
+ }
+ 
+-NTSTATUS PortMessageNotify(
++NTSTATUS CommunicationPort::PortMessageNotify(
+ 	_In_opt_ PVOID PortCookie,
+ 	_In_reads_bytes_opt_(InputBufferLength) PVOID InputBuffer,
+ 	_In_ ULONG InputBufferLength,
+diff --git a/driver/Communication.h b/driver/Communication.h
+index 266f4e2b4399c7e5371d2ef1ac03ce711cb520d7..a3e93c579a493164d7e1cdb8b7fe56d3dafe6da6 100644
+--- a/driver/Communication.h
++++ b/driver/Communication.h
+@@ -1,26 +1,49 @@
+ #pragma once
+ 
+-NTSTATUS InitFilterPort(
+-	_In_ PFLT_FILTER Filter);
++class CommunicationPort
++{
++public:
+ 
+-void FinalizeFilterPort();
++	static CommunicationPort* Instance()
++	{
++        static CommunicationPort singleton;
++        return &singleton;
++	}
+ 
+-NTSTATUS PortConnectNotify(
+-	_In_ PFLT_PORT ClientPort,
+-	_In_opt_ PVOID ServerPortCookie,
+-	_In_reads_bytes_opt_(SizeOfContext) PVOID ConnectionContext,
+-	_In_ ULONG SizeOfContext,
+-	_Outptr_result_maybenull_ PVOID* ConnectionPortCookie);
++	NTSTATUS InitFilterPort(
++		_In_ PFLT_FILTER Filter);
+ 
+-void PortDisconnectNotify(_In_opt_ PVOID ConnectionCookie);
++	void FinalizeFilterPort();
+ 
+-NTSTATUS PortMessageNotify(
+-	_In_opt_ PVOID PortCookie,
+-	_In_reads_bytes_opt_(InputBufferLength) PVOID InputBuffer,
+-	_In_ ULONG InputBufferLength,
+-	_Out_writes_bytes_to_opt_(OutputBufferLength, *ReturnOutputBufferLength) PVOID OutputBuffer,
+-	_In_ ULONG OutputBufferLength,
+-	_Out_ PULONG ReturnOutputBufferLength);
++	static NTSTATUS PortConnectNotify(
++		_In_ PFLT_PORT ClientPort,
++		_In_opt_ PVOID ServerPortCookie,
++		_In_reads_bytes_opt_(SizeOfContext) PVOID ConnectionContext,
++		_In_ ULONG SizeOfContext,
++		_Outptr_result_maybenull_ PVOID* ConnectionPortCookie);
+ 
+-NTSTATUS SendOutputMessage(_In_ PortMessageType type, _In_ LPCWSTR formatString, ...);
++	static void PortDisconnectNotify(_In_opt_ PVOID ConnectionCookie);
+ 
++	static NTSTATUS PortMessageNotify(
++		_In_opt_ PVOID PortCookie,
++		_In_reads_bytes_opt_(InputBufferLength) PVOID InputBuffer,
++		_In_ ULONG InputBufferLength,
++		_Out_writes_bytes_to_opt_(OutputBufferLength, *ReturnOutputBufferLength) PVOID OutputBuffer,
++		_In_ ULONG OutputBufferLength,
++		_Out_ PULONG ReturnOutputBufferLength);
++
++	NTSTATUS SendOutputMessage(_In_ PortMessageType type, _In_ LPCWSTR formatString, ...);
++
++    ULONG GetConnectedPID() const { return m_ConnectedPID; }
++
++private:
++
++	PFLT_PORT m_Port = {};
++	PFLT_PORT m_ClientPort = {};
++	PFLT_FILTER m_Filter = {};
++
++	PEPROCESS m_ConnectedProcess = {};
++	ULONG     m_ConnectedPID = {};
++
++	CommunicationPort() = default;
++};
+diff --git a/driver/Driver.cpp b/driver/Driver.cpp
+index 808ba9d50bbfe27cebb5e8e1c95ce32f5d0d24e9..ffd0b4acf15718526b723dc78979d4c037b3ef0b 100644
+--- a/driver/Driver.cpp
++++ b/driver/Driver.cpp
+@@ -24,7 +24,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
+ 		//
+ 		// Set up our filter communication port
+ 		//
+-        if (!NT_SUCCESS(InitFilterPort(g_Filter))) 
++        if (!NT_SUCCESS(CommunicationPort::Instance()->InitFilterPort(g_Filter))) 
+ 		{
+             KdPrint((DRIVER_PREFIX "Failed to initialize filter port (0x%X)\n", status));
+             break;
+diff --git a/driver/MiniFilter.cpp b/driver/MiniFilter.cpp
+index baf92c21894c0b1a06a066792d61be05f05fce1e..1cff0a25e9c9c0d36029f72215d1030c5fe02e85 100644
+--- a/driver/MiniFilter.cpp
++++ b/driver/MiniFilter.cpp
+@@ -85,6 +85,12 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 		return FLT_POSTOP_FINISHED_PROCESSING;
+ 	}
+ 
++	if (HandleToUlong(PsGetCurrentProcessId()) == CommunicationPort::Instance()->GetConnectedPID())
++    {
++        // Don't care about our own activity
++        return FLT_POSTOP_FINISHED_PROCESSING;
++    }
++
+ 	//
+ 	// Ignore attribute opens to save a *lot* of useless processing.
+ 	//
+@@ -145,16 +151,11 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 		Process p(PsGetCurrentProcess());
+ 		p.GetImageFileNameOnly(processName);
+ 
+-		SendOutputMessage(PortMessageType::FileMessage,L"%wZ (%u): Created SH context 0x%p for %wZ", 
+-			processName.Get(), HandleToUlong(PsGetCurrentProcessId()), context, &fileNameInfo->Name);
+-		if (DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopyDestination(FltObjects->FileObject))
+-		{
+-			SendOutputMessage(PortMessageType::FileMessage, L"\tOpened with copy destination flag");
+-		}
+-		if (DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopySource(FltObjects->FileObject))
+-		{
+-			SendOutputMessage(PortMessageType::FileMessage, L"\tOpened with copy source flag");
+-		}
++		CommunicationPort::Instance()->SendOutputMessage(PortMessageType::FileMessage,
++			L"%wZ (%u): Created SH context 0x%p for %wZ%ls%ls", 
++			processName.Get(), HandleToUlong(PsGetCurrentProcessId()), context, &fileNameInfo->Name,
++			DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopyDestination(FltObjects->FileObject) ? L"\n\tOpened with copy destination flag" : L"",
++			DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopySource(FltObjects->FileObject) ? L"\n\tOpened with copy source flag" : L"");
+ 	}
+ 
+ 	//
+@@ -173,67 +174,87 @@ FLT_PREOP_CALLBACK_STATUS OnPreWrite(
+ 	const auto& Parameters = Data->Iopb->Parameters.Write;
+ 	CompletionContext = nullptr;
+ 
++	StreamHandleContext* contextSrc = {};
++	StreamHandleContext* contextDest = {};
++	VolumeContext* VolumeContext = {};
++
+ 	if (IoGetTopLevelIrp() != nullptr)
+ 	{
+ 		return FLT_PREOP_SUCCESS_NO_CALLBACK;
+ 	}
+ 
+-	//
+-	// This may not exist
+-	//
+-	StreamHandleContext* context;
+-
+-	auto status = FltGetStreamHandleContext(FltObjects->Instance,
+-		FltObjects->FileObject,
+-		(PFLT_CONTEXT*)&context);
++	do {
+ 
+-	if (!NT_SUCCESS(status) || context == nullptr) {
+ 		//
+-		// no context, continue normally
++		// This may not exist
+ 		//
+-		return FLT_PREOP_SUCCESS_NO_CALLBACK;	
+-	}
+-
+-	do {
+-
+-		FilterFileNameInformation name(Data);
+-		if (!name)
+-		{
++		auto status = FltGetStreamHandleContext(FltObjects->Instance,
++			FltObjects->FileObject,
++			(PFLT_CONTEXT*)&contextSrc);
++
++		if (!NT_SUCCESS(status) || contextSrc == nullptr) {
++			//
++			// no context, that's normal.
++			//
+ 			break;
+ 		}
+ 
+ 		COPY_INFORMATION copyInfo = {};
+ 		status = DynamicImports::Instance()->FltGetCopyInformationFromCallbackData(Data, &copyInfo);
+ 		if (NT_SUCCESS(status))
+-		{
+-			// TODO: We should be able to figure out the instance for the source without that much trouble.
+-			FilterFileNameInformation sourceName (nullptr, copyInfo.SourceFileObject);
++		{	
++			status = VolumeContext::GetVolumeContextFromFileObject(FltObjects->Filter, copyInfo.SourceFileObject, &VolumeContext);
++			if (!NT_SUCCESS(status))
++			{
++				// That's weird... we should have a context for this file.
++				break;
++			}
++
++			FilterFileNameInformation destinationName(Data);
++			if (!destinationName)
++			{
++				break;
++			}
++
++			FilterFileNameInformation sourceName (VolumeContext->fltInstance, copyInfo.SourceFileObject);
+ 
+ 			UnicodeString processName;
+ 			Process p(PsGetCurrentProcess());
+ 			p.GetImageFileNameOnly(processName);
+ 
+ 			// This is always SYSTEM it seems.
+-			SendOutputMessage(PortMessageType::FileMessage, 
++			CommunicationPort::Instance()->SendOutputMessage(PortMessageType::FileMessage, 
+ 				L"%wZ (%u): Copy Notification (pos=%u, len=%u)\n\tDestination: %wZ (SH=%p)\n\tSource: %wZ",
+ 				&processName, HandleToULong(PsGetCurrentProcessId()), 
+ 				Parameters.ByteOffset, Parameters.Length, 
+-				&name->Name, 
+-				context,
++				&destinationName->Name, 
++				contextSrc,
+ 				sourceName ? &sourceName.Get()->Name : Process::GetUnknownProcessName());
+-		}
+ 
+-		Locker locker(context->Lock);
+-		context->m_writeCount++;
++			Locker locker(contextSrc->Lock);
++			contextSrc->m_writeCount++;
+ 
+-		if (context->m_writeCount == 1)
+-		{
+-			// First write
+-			KeQuerySystemTimePrecise(&context->m_firstWriteTime);
++			if (contextSrc->m_writeCount == 1)
++			{
++				// First write
++				KeQuerySystemTimePrecise(&contextSrc->m_firstWriteTime);				
++			}
+ 		}
++
+ 	} while (false);
+ 
+-	FltReleaseContext(context);
++	if (contextSrc)
++	{
++		FltReleaseContext(contextSrc);
++	}
++	if (contextDest)
++	{
++		FltReleaseContext(contextDest);
++	}
++	if (VolumeContext)
++	{
++        FltReleaseContext(VolumeContext);
++	}
+ 
+ 	//
+ 	// don't prevent the write regardless
+@@ -411,7 +432,7 @@ NTSTATUS MinifilterUnload(FLT_FILTER_UNLOAD_FLAGS Flags)
+ {
+ 	UNREFERENCED_PARAMETER(Flags);
+ 
+-	FinalizeFilterPort();
++	CommunicationPort::Instance()->FinalizeFilterPort();
+ 	FltUnregisterFilter(g_Filter);
+ 
+ 	return STATUS_SUCCESS;
+diff --git a/driver/VolumeContext.h b/driver/VolumeContext.h
+index db708e284d1b9b1953c3c24c5c2476786d8c9f26..a8a5ccbd7dbf2fbec76491210d9fdba98bc1a423 100644
+--- a/driver/VolumeContext.h
++++ b/driver/VolumeContext.h
+@@ -6,6 +6,7 @@ public:
+ 
+ 	UNICODE_STRING volumeName = {};
+     PFLT_VOLUME_PROPERTIES volumeProperties = {};
++	PFLT_INSTANCE fltInstance = {}; // We only ever attach once. What could go wrong?
+ 
+ 	VolumeContext()
+ 	{
+@@ -41,6 +42,8 @@ public:
+             *Context = nullptr;
+             return status;
+         }
++
++		(*Context)->fltInstance = FltObjects->Instance;
+         
+ 		return STATUS_SUCCESS;
+     }
+@@ -87,6 +90,19 @@ public:
+         return;
+     }
+ 
++	static NTSTATUS GetVolumeContextFromFileObject(PFLT_FILTER Filter, PFILE_OBJECT FileObject, _Out_ VolumeContext** Context)
++	{
++		*Context = nullptr;
++		PFLT_VOLUME Volume = {};
++		NTSTATUS status = FltGetVolumeFromFileObject(Filter, FileObject, &Volume);
++        if (NT_SUCCESS(status)) {
++			status = FltGetVolumeContext(Filter, Volume, reinterpret_cast<PFLT_CONTEXT*>(Context));
++			FltObjectDereference(Volume);
++        }
++
++		return status;
++	}
++
+ private:
+ 
+ 	NTSTATUS GetVolumeName(_In_ PFLT_VOLUME Volume, _Out_ UNICODE_STRING& VolumeName)
+@@ -108,7 +124,8 @@ private:
+ 
+ 			// We expect STATUS_BUFFER_TOO_SMALL here. If it's another error, get out.
+ 			if (status != STATUS_BUFFER_TOO_SMALL) {
+-				SendOutputMessage(PortMessageType::VolumeMessage, L"FltGetVolumeName (first call) failed with unexpected status: 0x%X\n", status);
++				CommunicationPort::Instance()->SendOutputMessage(PortMessageType::VolumeMessage, 
++					L"FltGetVolumeName (first call) failed with unexpected status: 0x%X\n", status);
+ 				break;
+ 			}
+ 
+@@ -124,7 +141,8 @@ private:
+ 				nullptr);
+ 
+ 			if (!NT_SUCCESS(status)) {
+-				SendOutputMessage(PortMessageType::VolumeMessage, L"FltGetVolumeName failed with status: 0x%X\n", status);
++				CommunicationPort::Instance()->SendOutputMessage(PortMessageType::VolumeMessage, 
++					L"FltGetVolumeName failed with status: 0x%X\n", status);
+ 				break;
+ 			}
+ 
+
+From 9c74ce9069540f65643625df9d1143c5c178b7dd Mon Sep 17 00:00:00 2001
+From: aallidin <aallidin@cisco.com>
+Date: Thu, 4 Sep 2025 22:49:05 -0400
+Subject: [PATCH] Add logic to send the section handle for source file up to
+ user mode so it can take sneak a peek.
+
+---
+ driver/Common.h          |  22 ++++++--
+ driver/Communication.cpp | 105 +++++++++++++++++++++++++++++++-----
+ driver/Communication.h   |   8 +++
+ driver/MiniFilter.cpp    | 136 +++++++++++++++++++++++++++++++++++++++++------
+ driver/SectionContext.h  |  77 +++++++++++++++++++++++++++
+ driver/VolumeContext.h   |  34 ++++++------
+ driver/pooltag.h         |   1 +
+ 7 files changed, 336 insertions(+), 47 deletions(-)
+
+diff --git a/driver/Common.h b/driver/Common.h
+index 23d94137c0bb1b4f9dac52bffd00ec260573200b..f086dcd07f9a131ee275f26a904acf6793df4547 100644
+--- a/driver/Common.h
++++ b/driver/Common.h
+@@ -3,15 +3,31 @@
+ enum class PortMessageType {
+ 	VolumeMessage = 1,
+ 	FileMessage = 2,
+-	ErrorMessage = 4,
++	SectionMessage = 3
+ };
+ 
+-struct PortMessage {
+-	PortMessageType type;
++struct PortStringMessage
++{
+ 	ULONG dataLenBytes;
+     UCHAR data[1]; // Variable length data follows
+ };
+ 
++struct PortSectionMessage
++{
++    ULONG fileSizeBytes;
++    HANDLE sectionHandle;
++};
++
++struct PortMessage {
++	PortMessageType type;
++
++	union
++	{
++		PortStringMessage stringMsg;
++        PortSectionMessage sectionMsg;
++	};
++};
++
+ #define FILTER_PORT_NAME L"\\CopyDetectPort"
+ 
+ constexpr ULONG COMMUNICATION_BUFFER_LEN = 1 << 15; // 32 KB
+diff --git a/driver/Communication.cpp b/driver/Communication.cpp
+index 4b2c72b5fbbcc4622e98bb27ca0ca6aa18592e04..a341f2e8c5d214c27419ff25def0671e81507785 100644
+--- a/driver/Communication.cpp
++++ b/driver/Communication.cpp
+@@ -57,9 +57,9 @@ void CommunicationPort::FinalizeFilterPort()
+ // Rudimentary output message sender.
+ NTSTATUS CommunicationPort::SendOutputMessage(_In_ PortMessageType type, _In_ LPCWSTR formatString, ...)
+ {
+-	NTSTATUS status = STATUS_INTERNAL_ERROR;
++	NTSTATUS status = STATUS_CONNECTION_INVALID;
+ 
+-	if (m_ClientPort)
++	if (IsConnected())
+ 	{
+ 		va_list args;
+ 		va_start(args, formatString);
+@@ -73,17 +73,19 @@ NTSTATUS CommunicationPort::SendOutputMessage(_In_ PortMessageType type, _In_ LP
+ 		{
+ 			msg->type = type;
+ 
+-			UNICODE_STRING tmpString = { 0, COMMUNICATION_BUFFER_LEN - FIELD_OFFSET(PortMessage, data), reinterpret_cast<wchar_t*>(msg->data) };
++			UNICODE_STRING tmpString = { 0, 
++				COMMUNICATION_BUFFER_LEN - FIELD_OFFSET(PortMessage, stringMsg.data), 
++				reinterpret_cast<wchar_t*>(msg->stringMsg.data) };
+ 			if (NT_SUCCESS(status = RtlUnicodeStringVPrintf(&tmpString, formatString, args)))
+ 			{
+-				msg->dataLenBytes = tmpString.Length;
++				msg->stringMsg.dataLenBytes = tmpString.Length;
+ 
+ 				// LARGE_INTEGER timeout;
+ 				// timeout.QuadPart = -10000 * 100; // 100 msec
+ 				status = FltSendMessage(m_Filter,
+ 					&m_ClientPort,
+ 					msg,
+-					msg->dataLenBytes + FIELD_OFFSET(PortMessage, data),
++					sizeof(PortMessage) + msg->stringMsg.dataLenBytes,
+ 					nullptr,
+ 					nullptr,
+ 					nullptr);
+@@ -100,6 +102,80 @@ NTSTATUS CommunicationPort::SendOutputMessage(_In_ PortMessageType type, _In_ LP
+ 	return status;
+ }
+ 
++NTSTATUS CommunicationPort::GetConnectedProcessHandle(HANDLE& Process) const
++{
++	Process = nullptr;
++    auto status = STATUS_CONNECTION_INVALID;
++
++    if (IsConnected())
++    {
++		 // Access type is kernel - this should always be permitted, according to MSDN
++		 status = ObOpenObjectByPointer(
++			m_ConnectedProcess,
++			OBJ_KERNEL_HANDLE,
++			NULL,
++			PROCESS_ALL_ACCESS,
++			*PsProcessType,
++			KernelMode,
++			&Process);
++    }
++    
++	return status;
++}
++
++NTSTATUS CommunicationPort::GetConnectedProcessObject(PEPROCESS& process) const
++{
++    process = nullptr;
++    auto status = STATUS_CONNECTION_INVALID;
++
++    if (IsConnected())
++    {
++        ObReferenceObject(m_ConnectedProcess);
++        process = m_ConnectedProcess;
++        status = STATUS_SUCCESS;
++    }
++    return status;
++}
++
++NTSTATUS CommunicationPort::SendSectionMessage(_In_ HANDLE SectionHandle, _In_ ULONG FileSizeBytes)
++{
++	NTSTATUS status = STATUS_CONNECTION_INVALID;
++
++	if (IsConnected())
++	{
++		auto msg = (PortMessage*)ExAllocatePool2(
++			POOL_FLAG_PAGED,
++			sizeof(PortMessage) + sizeof(HANDLE),
++			COMMUNINCATION_POOLTAG);
++
++		if (msg)
++		{
++			// POC hack - send the file size in the dataLenBytes buffer
++			msg->type = PortMessageType::SectionMessage;
++            msg->sectionMsg.fileSizeBytes = FileSizeBytes;
++			msg->sectionMsg.sectionHandle = SectionHandle;
++
++			// LARGE_INTEGER timeout;
++			// timeout.QuadPart = -10000 * 100; // 100 msec
++			status = FltSendMessage(m_Filter,
++				&m_ClientPort,
++				msg,
++				sizeof(PortMessage),
++				nullptr,
++				nullptr,
++				nullptr);
++
++			ExFreePool(msg);
++		}
++		else
++		{
++			status = STATUS_NO_MEMORY;
++		}
++	}
++
++	return status;
++}
++
+ NTSTATUS CommunicationPort::PortConnectNotify(
+ 	_In_ PFLT_PORT ClientPort,
+ 	_In_opt_ PVOID ServerPortCookie,
+@@ -112,9 +188,11 @@ NTSTATUS CommunicationPort::PortConnectNotify(
+ 	UNREFERENCED_PARAMETER(SizeOfContext);
+ 	
+ 	ConnectionPortCookie = nullptr;
+-	Instance()->m_ClientPort = ClientPort;
+-    Instance()->m_ConnectedProcess = PsGetCurrentProcess();
+-    Instance()->m_ConnectedPID = HandleToUlong(PsGetCurrentProcessId());
++
++	CommunicationPort* instance = Instance();
++	instance->m_ClientPort = ClientPort;
++    instance->m_ConnectedProcess = PsGetCurrentProcess();
++    instance->m_ConnectedPID = HandleToUlong(PsGetCurrentProcessId());
+ 
+ 	return STATUS_SUCCESS;
+ }
+@@ -122,10 +200,13 @@ NTSTATUS CommunicationPort::PortConnectNotify(
+ void CommunicationPort::PortDisconnectNotify(_In_opt_ PVOID ConnectionCookie) {
+ 	UNREFERENCED_PARAMETER(ConnectionCookie);
+ 
+-	FltCloseClientPort(Instance()->m_Filter, &Instance()->m_ClientPort);
+-	Instance()->m_ClientPort = {};
+-	Instance()->m_ConnectedPID = {};
+-	Instance()->m_ConnectedProcess = {};
++	CommunicationPort* instance = Instance();
++
++	FltCloseClientPort(instance->m_Filter, &instance->m_ClientPort);
++
++	instance->m_ClientPort = {};
++	instance->m_ConnectedPID = {};
++	instance->m_ConnectedProcess = {};
+ }
+ 
+ NTSTATUS CommunicationPort::PortMessageNotify(
+diff --git a/driver/Communication.h b/driver/Communication.h
+index a3e93c579a493164d7e1cdb8b7fe56d3dafe6da6..97557207d5e457e3742321bdf7aa23129d945324 100644
+--- a/driver/Communication.h
++++ b/driver/Communication.h
+@@ -33,9 +33,17 @@ public:
+ 		_Out_ PULONG ReturnOutputBufferLength);
+ 
+ 	NTSTATUS SendOutputMessage(_In_ PortMessageType type, _In_ LPCWSTR formatString, ...);
++	NTSTATUS SendSectionMessage(_In_ HANDLE Sectionhandle, _In_ ULONG FileSizeBytes);
+ 
+     ULONG GetConnectedPID() const { return m_ConnectedPID; }
+ 
++	// Caller needs to call ZwClose() on this handle
++	NTSTATUS GetConnectedProcessHandle(HANDLE& hProcess) const;
++	// Caller needs to call ObDereferenceObject on object
++    NTSTATUS GetConnectedProcessObject(PEPROCESS& process) const;
++
++    bool IsConnected() const { return m_ClientPort != nullptr; }
++
+ private:
+ 
+ 	PFLT_PORT m_Port = {};
+diff --git a/driver/MiniFilter.cpp b/driver/MiniFilter.cpp
+index 1cff0a25e9c9c0d36029f72215d1030c5fe02e85..2d55b74e014c11003e42f323eefe922daaca8cb3 100644
+--- a/driver/MiniFilter.cpp
++++ b/driver/MiniFilter.cpp
+@@ -13,6 +13,8 @@
+ #include "FileContext.h"
+ #include "StreamHandleContext.h"
+ #include "StreamContext.h"
++#include "SectionContext.h"
++
+ #include "DynamicImports.h"
+ #include "Process.h"
+ 
+@@ -152,8 +154,9 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 		p.GetImageFileNameOnly(processName);
+ 
+ 		CommunicationPort::Instance()->SendOutputMessage(PortMessageType::FileMessage,
+-			L"%wZ (%u): Created SH context 0x%p for %wZ%ls%ls", 
+-			processName.Get(), HandleToUlong(PsGetCurrentProcessId()), context, &fileNameInfo->Name,
++			L"%wZ (%u,%u): Created SH context 0x%p for %wZ%ls%ls", 
++			processName.Get(), HandleToUlong(PsGetCurrentProcessId()), HandleToUlong(PsGetCurrentThreadId()),
++			context, &fileNameInfo->Name,
+ 			DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopyDestination(FltObjects->FileObject) ? L"\n\tOpened with copy destination flag" : L"",
+ 			DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopySource(FltObjects->FileObject) ? L"\n\tOpened with copy source flag" : L"");
+ 	}
+@@ -176,7 +179,10 @@ FLT_PREOP_CALLBACK_STATUS OnPreWrite(
+ 
+ 	StreamHandleContext* contextSrc = {};
+ 	StreamHandleContext* contextDest = {};
+-	VolumeContext* VolumeContext = {};
++	VolumeContext* volumeContext = {};
++	SectionContext* sectionContext = {};
++
++	HANDLE hProcess = {};
+ 
+ 	if (IoGetTopLevelIrp() != nullptr)
+ 	{
+@@ -199,11 +205,13 @@ FLT_PREOP_CALLBACK_STATUS OnPreWrite(
+ 			break;
+ 		}
+ 
++		// We only care if this is NtCopyFileChunk
++		// TODO: We could also check for previous mode (it should be kernel)
+ 		COPY_INFORMATION copyInfo = {};
+ 		status = DynamicImports::Instance()->FltGetCopyInformationFromCallbackData(Data, &copyInfo);
+ 		if (NT_SUCCESS(status))
+-		{	
+-			status = VolumeContext::GetVolumeContextFromFileObject(FltObjects->Filter, copyInfo.SourceFileObject, &VolumeContext);
++		{
++			status = VolumeContext::GetVolumeContextFromFileObject(FltObjects->Filter, copyInfo.SourceFileObject, &volumeContext);
+ 			if (!NT_SUCCESS(status))
+ 			{
+ 				// That's weird... we should have a context for this file.
+@@ -213,32 +221,108 @@ FLT_PREOP_CALLBACK_STATUS OnPreWrite(
+ 			FilterFileNameInformation destinationName(Data);
+ 			if (!destinationName)
+ 			{
++				// Also weird.
+ 				break;
+ 			}
+ 
+-			FilterFileNameInformation sourceName (VolumeContext->fltInstance, copyInfo.SourceFileObject);
++			FilterFileNameInformation sourceName(volumeContext->fltInstance, copyInfo.SourceFileObject);
+ 
+ 			UnicodeString processName;
+ 			Process p(PsGetCurrentProcess());
+ 			p.GetImageFileNameOnly(processName);
+ 
+-			// This is always SYSTEM it seems.
+-			CommunicationPort::Instance()->SendOutputMessage(PortMessageType::FileMessage, 
+-				L"%wZ (%u): Copy Notification (pos=%u, len=%u)\n\tDestination: %wZ (SH=%p)\n\tSource: %wZ",
+-				&processName, HandleToULong(PsGetCurrentProcessId()), 
+-				Parameters.ByteOffset, Parameters.Length, 
+-				&destinationName->Name, 
++			// This is always called in the SYSTEM process it seems.
++			CommunicationPort::Instance()->SendOutputMessage(PortMessageType::FileMessage,
++				L"%wZ (%u, %u): Copy Notification (pos=%u, len=%u)\n\tDestination: %wZ (SH=%p)\n\tSource: %wZ",
++                &processName, HandleToULong(PsGetCurrentProcessId()), HandleToULong(PsGetCurrentThreadId()),
++				Parameters.ByteOffset, Parameters.Length,
++				&destinationName->Name,
+ 				contextSrc,
+ 				sourceName ? &sourceName.Get()->Name : Process::GetUnknownProcessName());
+ 
+ 			Locker locker(contextSrc->Lock);
+ 			contextSrc->m_writeCount++;
+ 
+-			if (contextSrc->m_writeCount == 1)
++			if (contextSrc->m_writeCount > 1)
+ 			{
+-				// First write
+-				KeQuerySystemTimePrecise(&contextSrc->m_firstWriteTime);				
++				// Not the first write.
++				break;
+ 			}
++
++			//
++			// This is the first chunk of the copy - let user mode know about it.
++			// TODO: When testing on the network, I noticed multiple chunks being written in parallel.
++			// Look at locking and see if it is adequate to handle this.
++			//
++
++			if (!NT_SUCCESS(status = CommunicationPort::Instance()->GetConnectedProcessHandle(hProcess)))
++			{
++				// If we're not connected don't go any further.
++				break;
++			}
++
++			status = SectionContext::Factory(FltObjects,
++				hProcess, // SectionContext takes ownership of this handle
++				&sectionContext);
++
++			if (!NT_SUCCESS(status))
++			{
++				break;
++			}
++			hProcess = {};
++
++			OBJECT_ATTRIBUTES oa = {};
++			InitializeObjectAttributes(&oa,
++				NULL,
++				OBJ_CASE_INSENSITIVE, // user handle
++				NULL,
++				NULL);
++
++			LARGE_INTEGER sectionSize = {};
++			status = FltCreateSectionForDataScan(volumeContext->fltInstance,
++				copyInfo.SourceFileObject,
++				sectionContext,
++				SECTION_MAP_READ,
++				&oa,
++				nullptr,
++				PAGE_READONLY,
++				SEC_COMMIT,
++				0,
++				&sectionContext->SectionHandle,
++				&sectionContext->SectionObject,
++				&sectionSize);
++
++			if (!NT_SUCCESS(status))
++			{
++				break;
++			}
++
++			// Bounds are good... 
++			if (sectionSize.QuadPart == 0 ||
++				sectionSize.QuadPart > (static_cast<ULONGLONG>(1024) * 1024 * 32))
++			{
++				break;
++			}
++
++			// Now we need the section handle in our process
++			HANDLE TargetProcessSectionHandle = {};
++			if (!NT_SUCCESS(status = ZwDuplicateObject(ZwCurrentProcess(),
++				sectionContext->SectionHandle,
++				sectionContext->TargetProcessHandle,
++				&TargetProcessSectionHandle,
++				0,
++				0,
++				DUPLICATE_SAME_ACCESS | DUPLICATE_SAME_ATTRIBUTES | DUPLICATE_CLOSE_SOURCE)))
++			{
++				break;
++			}
++
++            // We transferred ownership of the handle to the target process and closed the source
++            sectionContext->SectionHandle = TargetProcessSectionHandle;
++            sectionContext->SectionSize = static_cast<ULONG>(sectionSize.QuadPart);
++				
++			CommunicationPort::Instance()->SendSectionMessage(sectionContext->SectionHandle,
++				sectionContext->SectionSize);
+ 		}
+ 
+ 	} while (false);
+@@ -246,14 +330,31 @@ FLT_PREOP_CALLBACK_STATUS OnPreWrite(
+ 	if (contextSrc)
+ 	{
+ 		FltReleaseContext(contextSrc);
++		contextSrc = nullptr;
+ 	}
+ 	if (contextDest)
+ 	{
+ 		FltReleaseContext(contextDest);
++		contextDest = nullptr;
++	}
++	if (volumeContext)
++	{
++        FltReleaseContext(volumeContext);
++		volumeContext = nullptr;
++	}
++	if (sectionContext)
++	{
++		if (sectionContext->IsSectionCreated())
++		{
++			FltCloseSectionForDataScan(sectionContext);
++		}
++		FltReleaseContext(sectionContext);
++        sectionContext = nullptr;
+ 	}
+-	if (VolumeContext)
++	if (hProcess)
+ 	{
+-        FltReleaseContext(VolumeContext);
++		ZwClose(hProcess);
++		hProcess = nullptr;
+ 	}
+ 
+ 	//
+@@ -391,6 +492,7 @@ NTSTATUS InitMiniFilter(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPat
+ 			{ FLT_VOLUME_CONTEXT, 0, VolumeContext::Cleanup, sizeof(VolumeContext), VOLUME_POOLTAG },
+             { FLT_STREAMHANDLE_CONTEXT, 0, StreamHandleContext::Cleanup, sizeof(StreamHandleContext) , STREAMHANDLE_POOLTAG },
+             { FLT_STREAM_CONTEXT, 0, StreamContext::Cleanup, sizeof(StreamContext), STREAM_POOLTAG },
++            { FLT_SECTION_CONTEXT, 0, SectionContext::Cleanup, sizeof(SectionContext), SECTION_POOLTAG },
+ 			{ FLT_CONTEXT_END }
+ 		};
+ 
+diff --git a/driver/SectionContext.h b/driver/SectionContext.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..139a84be47ae757a04e201c59b2ee9afa5c79545
+--- /dev/null
++++ b/driver/SectionContext.h
+@@ -0,0 +1,77 @@
++#pragma once
++
++class SectionContext {
++
++public:
++    HANDLE SectionHandle = {};
++    PVOID SectionObject = {};
++    ULONG SectionSize = {};
++
++    HANDLE TargetProcessHandle = {};
++
++    // We take ownership of the handle, to prevent races.
++    SectionContext(HANDLE ProcessHandle)
++    {
++        TargetProcessHandle = ProcessHandle;
++    }
++
++    ~SectionContext()
++    {
++        if (SectionHandle)
++        {
++            ZwClose(SectionHandle);
++            SectionHandle = nullptr;
++        }
++
++        if (SectionObject)
++        {
++            ObDereferenceObject(SectionObject);
++            SectionObject = nullptr;
++        }
++
++        if (TargetProcessHandle && TargetProcessHandle != ZwCurrentProcess())
++        {
++            ZwClose(TargetProcessHandle);
++            TargetProcessHandle = nullptr;
++        }
++    }
++
++    bool IsSectionCreated() const
++    {
++        return SectionHandle != nullptr;
++    }
++
++    static NTSTATUS Factory(_In_ PCFLT_RELATED_OBJECTS FltObjects, 
++        _In_ HANDLE ProcessHandle,
++        _Out_ SectionContext** Context)
++    {
++        *Context = nullptr;
++
++        auto status = FltAllocateContext(FltObjects->Filter,
++            FLT_SECTION_CONTEXT, sizeof(SectionContext), NonPagedPool,
++            (PFLT_CONTEXT*)Context);
++
++        if (!NT_SUCCESS(status)) {
++            return status;
++        }
++
++        // Placement new
++        new (*Context) SectionContext(ProcessHandle);
++
++        return STATUS_SUCCESS;
++    }
++
++    // This is essentially our destructor, called by Filter Manager when the context is deleted
++    static void Cleanup(_In_ PFLT_CONTEXT Context, _In_ FLT_CONTEXT_TYPE ContextType)
++    {
++        if (ContextType != FLT_SECTION_CONTEXT)
++        {
++            ASSERT(FALSE);
++            return;
++        }
++        auto ctx = reinterpret_cast<SectionContext*>(Context);
++        ctx->~SectionContext();
++
++        return;
++    }
++};
+\ No newline at end of file
+diff --git a/driver/VolumeContext.h b/driver/VolumeContext.h
+index a8a5ccbd7dbf2fbec76491210d9fdba98bc1a423..4d2477542b85b991de1e80083da3082bf02b6fa0 100644
+--- a/driver/VolumeContext.h
++++ b/driver/VolumeContext.h
+@@ -7,9 +7,25 @@ public:
+ 	UNICODE_STRING volumeName = {};
+     PFLT_VOLUME_PROPERTIES volumeProperties = {};
+ 	PFLT_INSTANCE fltInstance = {}; // We only ever attach once. What could go wrong?
++	NTSTATUS registerForDataScanStatus = {};
+ 
+ 	VolumeContext()
+ 	{
++	}
++
++	~VolumeContext()
++	{
++		if (volumeName.Buffer)
++		{
++			ExFreePoolWithTag(volumeName.Buffer, VOLUME_POOLTAG);
++			volumeName.Buffer = nullptr;
++		}
++
++		if (volumeProperties)
++		{
++			ExFreePoolWithTag(volumeProperties, VOLUME_POOLTAG);
++			volumeProperties = nullptr;
++		}
+ 
+ 	}
+ 
+@@ -44,6 +60,8 @@ public:
+         }
+ 
+ 		(*Context)->fltInstance = FltObjects->Instance;
++
++		(*Context)->registerForDataScanStatus = FltRegisterForDataScan(FltObjects->Instance);
+         
+ 		return STATUS_SUCCESS;
+     }
+@@ -75,17 +93,7 @@ public:
+         }
+ 
+         auto ctx = reinterpret_cast<VolumeContext*>(Context);
+-        if (ctx->volumeName.Buffer)
+-        {
+-            ExFreePoolWithTag(ctx->volumeName.Buffer, VOLUME_POOLTAG);
+-            ctx->volumeName.Buffer = nullptr;
+-        }
+-
+-		if (ctx->volumeProperties)
+-		{
+-			ExFreePoolWithTag(ctx->volumeProperties, VOLUME_POOLTAG);
+-			ctx->volumeProperties = nullptr;
+-		}
++		ctx->~VolumeContext();
+ 
+         return;
+     }
+@@ -124,8 +132,6 @@ private:
+ 
+ 			// We expect STATUS_BUFFER_TOO_SMALL here. If it's another error, get out.
+ 			if (status != STATUS_BUFFER_TOO_SMALL) {
+-				CommunicationPort::Instance()->SendOutputMessage(PortMessageType::VolumeMessage, 
+-					L"FltGetVolumeName (first call) failed with unexpected status: 0x%X\n", status);
+ 				break;
+ 			}
+ 
+@@ -141,8 +147,6 @@ private:
+ 				nullptr);
+ 
+ 			if (!NT_SUCCESS(status)) {
+-				CommunicationPort::Instance()->SendOutputMessage(PortMessageType::VolumeMessage, 
+-					L"FltGetVolumeName failed with status: 0x%X\n", status);
+ 				break;
+ 			}
+ 
+diff --git a/driver/pooltag.h b/driver/pooltag.h
+index bfb804a51ddebae491a5a961dc45077abfc5ff48..0d7a35920e684b2854204f8d07011baeb0951069 100644
+--- a/driver/pooltag.h
++++ b/driver/pooltag.h
+@@ -5,3 +5,4 @@
+ #define FILE_POOLTAG 'ifAA'
+ #define STREAMHANDLE_POOLTAG 'hsAA'
+ #define STREAM_POOLTAG 'tsAA'
++#define SECTION_POOLTAG 'csAA'
+
+From 2895d9e7d84fff5d1dc674564e43cd4a83d9a077 Mon Sep 17 00:00:00 2001
+From: aallidin <aallidin@cisco.com>
+Date: Fri, 5 Sep 2025 11:33:11 -0400
+Subject: [PATCH] Extract code to send handle to user mode.
+
+---
+ driver/MiniFilter.cpp   | 236 +++++++++++++++++++++++++++---------------------
+ driver/SectionContext.h |   5 +-
+ 2 files changed, 137 insertions(+), 104 deletions(-)
+
+diff --git a/driver/MiniFilter.cpp b/driver/MiniFilter.cpp
+index 2d55b74e014c11003e42f323eefe922daaca8cb3..259301db6c64bfdda64aefd52d56a2e97b529db8 100644
+--- a/driver/MiniFilter.cpp
++++ b/driver/MiniFilter.cpp
+@@ -66,6 +66,107 @@ VOID MinifilterInstanceTeardownComplete(PCFLT_RELATED_OBJECTS FltObjects, FLT_IN
+ 	UNREFERENCED_PARAMETER(Flags);
+ }
+ 
++NTSTATUS SendFileDataToUserMode(PFLT_FILTER Filter, PFLT_INSTANCE FltInstance, PFILE_OBJECT FileObject)
++{
++	NTSTATUS status = STATUS_SUCCESS;
++
++	SectionContext* sectionContext = {};
++	HANDLE hProcess = {};
++
++	do
++	{
++
++		if (!NT_SUCCESS(status = CommunicationPort::Instance()->GetConnectedProcessHandle(hProcess)))
++		{
++			// If we're not connected don't go any further.
++			break;
++		}
++
++		status = SectionContext::Factory(Filter,
++			hProcess, // SectionContext takes ownership of this handle
++			&sectionContext);
++
++		if (!NT_SUCCESS(status))
++		{
++			break;
++		}
++		hProcess = {};
++
++		OBJECT_ATTRIBUTES oa = {};
++		InitializeObjectAttributes(&oa,
++			NULL,
++			OBJ_CASE_INSENSITIVE, // user handle
++			NULL,
++			NULL);
++
++		LARGE_INTEGER sectionSize = {};
++		status = FltCreateSectionForDataScan(FltInstance,
++			FileObject,
++			sectionContext,
++			SECTION_MAP_READ,
++			&oa,
++			nullptr,
++			PAGE_READONLY,
++			SEC_COMMIT,
++			0,
++			&sectionContext->SectionHandle,
++			&sectionContext->SectionObject,
++			&sectionSize);
++
++		if (!NT_SUCCESS(status))
++		{
++			break;
++		}
++
++		// Bounds are good... 
++		if (sectionSize.QuadPart == 0 ||
++			sectionSize.QuadPart > (static_cast<ULONGLONG>(1024) * 1024 * 32))
++		{
++			break;
++		}
++
++		// Now we need the section handle in our process
++		HANDLE TargetProcessSectionHandle = {};
++		if (!NT_SUCCESS(status = ZwDuplicateObject(ZwCurrentProcess(),
++			sectionContext->SectionHandle,
++			sectionContext->TargetProcessHandle,
++			&TargetProcessSectionHandle,
++			0,
++			0,
++			DUPLICATE_SAME_ACCESS | DUPLICATE_SAME_ATTRIBUTES | DUPLICATE_CLOSE_SOURCE)))
++		{
++			break;
++		}
++
++		// We transferred ownership of the handle to the target process and closed the source
++		sectionContext->SectionHandle = TargetProcessSectionHandle;
++		sectionContext->SectionSize = static_cast<ULONG>(sectionSize.QuadPart);
++
++		CommunicationPort::Instance()->SendSectionMessage(sectionContext->SectionHandle,
++			sectionContext->SectionSize);
++
++	} while (false);
++
++	if (sectionContext)
++	{
++		if (sectionContext->IsSectionCreated())
++		{
++			FltCloseSectionForDataScan(sectionContext);
++		}
++		FltReleaseContext(sectionContext);
++		sectionContext = nullptr;
++	}
++
++	if (hProcess)
++	{
++		ZwClose(hProcess);
++		hProcess = nullptr;
++	}
++
++	return status;
++}
++
++_IRQL_requires_max_(PASSIVE_LEVEL)
+ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data, 
+ 	_In_ PCFLT_RELATED_OBJECTS FltObjects, 
+ 	_In_opt_ PVOID, 
+@@ -106,21 +207,29 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 	// Ignore directories
+ 	// 
+ 	BOOLEAN dir = FALSE;
+-	if (!NT_SUCCESS(FltIsDirectory(FltObjects->FileObject, FltObjects->Instance, &dir)))
++	if (!NT_SUCCESS(FltIsDirectory(FltObjects->FileObject, FltObjects->Instance, &dir)) || dir)
+ 	{
+ 		return FLT_POSTOP_FINISHED_PROCESSING;
+ 	}
+ 
+-	if (dir) {
+-		//
+-		// not interesting
+-		//
+-		return FLT_POSTOP_FINISHED_PROCESSING;
+-	}
+-
++	//
+ 	// We only care about copying in this POC.
+-	if (!DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopyDestination(FltObjects->FileObject) &&
+-		!DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopySource(FltObjects->FileObject))
++	//
++	if (DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopyDestination(FltObjects->FileObject))
++	{
++		if (0 == (desiredAccess & FILE_WRITE_DATA))
++		{
++			return FLT_POSTOP_FINISHED_PROCESSING;
++		}
++	}
++	else if (DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopySource(FltObjects->FileObject))
++	{
++		if (0 == (desiredAccess & FILE_READ_DATA))
++		{
++			return FLT_POSTOP_FINISHED_PROCESSING;
++		}
++	}
++	else
+ 	{
+ 		return FLT_POSTOP_FINISHED_PROCESSING;
+ 	}
+@@ -145,7 +254,7 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 	//
+ 	if (!NT_SUCCESS(status = StreamHandleContext::SetContext(FltObjects, context, true)))
+ 	{
+-		KdPrint(("Failed to set file context (0x%08X)\n", status));
++		KdPrint(("Failed to set SH context (0x%08X)\n", status));
+ 	}
+ 	else
+ 	{
+@@ -154,9 +263,11 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 		p.GetImageFileNameOnly(processName);
+ 
+ 		CommunicationPort::Instance()->SendOutputMessage(PortMessageType::FileMessage,
+-			L"%wZ (%u,%u): Created SH context 0x%p for %wZ%ls%ls", 
++			L"%wZ (%u,%u): Created context SH=%p, FO=%p, %wZ%ls%ls", 
+ 			processName.Get(), HandleToUlong(PsGetCurrentProcessId()), HandleToUlong(PsGetCurrentThreadId()),
+-			context, &fileNameInfo->Name,
++			context, 
++            FltObjects->FileObject,
++			&fileNameInfo->Name,
+ 			DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopyDestination(FltObjects->FileObject) ? L"\n\tOpened with copy destination flag" : L"",
+ 			DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopySource(FltObjects->FileObject) ? L"\n\tOpened with copy source flag" : L"");
+ 	}
+@@ -169,6 +280,7 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 	return FLT_POSTOP_FINISHED_PROCESSING;
+ }
+ 
++_IRQL_requires_max_(APC_LEVEL)
+ FLT_PREOP_CALLBACK_STATUS OnPreWrite(
+ 	_Inout_ PFLT_CALLBACK_DATA Data,
+ 	_In_ PCFLT_RELATED_OBJECTS FltObjects,
+@@ -180,9 +292,6 @@ FLT_PREOP_CALLBACK_STATUS OnPreWrite(
+ 	StreamHandleContext* contextSrc = {};
+ 	StreamHandleContext* contextDest = {};
+ 	VolumeContext* volumeContext = {};
+-	SectionContext* sectionContext = {};
+-
+-	HANDLE hProcess = {};
+ 
+ 	if (IoGetTopLevelIrp() != nullptr)
+ 	{
+@@ -234,7 +343,9 @@ FLT_PREOP_CALLBACK_STATUS OnPreWrite(
+ 			// This is always called in the SYSTEM process it seems.
+ 			CommunicationPort::Instance()->SendOutputMessage(PortMessageType::FileMessage,
+ 				L"%wZ (%u, %u): Copy Notification (pos=%u, len=%u)\n\tDestination: %wZ (SH=%p)\n\tSource: %wZ",
+-                &processName, HandleToULong(PsGetCurrentProcessId()), HandleToULong(PsGetCurrentThreadId()),
++                &processName, 
++				HandleToULong(PsGetCurrentProcessId()), 
++				HandleToULong(PsGetCurrentThreadId()),
+ 				Parameters.ByteOffset, Parameters.Length,
+ 				&destinationName->Name,
+ 				contextSrc,
+@@ -254,75 +365,7 @@ FLT_PREOP_CALLBACK_STATUS OnPreWrite(
+ 			// TODO: When testing on the network, I noticed multiple chunks being written in parallel.
+ 			// Look at locking and see if it is adequate to handle this.
+ 			//
+-
+-			if (!NT_SUCCESS(status = CommunicationPort::Instance()->GetConnectedProcessHandle(hProcess)))
+-			{
+-				// If we're not connected don't go any further.
+-				break;
+-			}
+-
+-			status = SectionContext::Factory(FltObjects,
+-				hProcess, // SectionContext takes ownership of this handle
+-				&sectionContext);
+-
+-			if (!NT_SUCCESS(status))
+-			{
+-				break;
+-			}
+-			hProcess = {};
+-
+-			OBJECT_ATTRIBUTES oa = {};
+-			InitializeObjectAttributes(&oa,
+-				NULL,
+-				OBJ_CASE_INSENSITIVE, // user handle
+-				NULL,
+-				NULL);
+-
+-			LARGE_INTEGER sectionSize = {};
+-			status = FltCreateSectionForDataScan(volumeContext->fltInstance,
+-				copyInfo.SourceFileObject,
+-				sectionContext,
+-				SECTION_MAP_READ,
+-				&oa,
+-				nullptr,
+-				PAGE_READONLY,
+-				SEC_COMMIT,
+-				0,
+-				&sectionContext->SectionHandle,
+-				&sectionContext->SectionObject,
+-				&sectionSize);
+-
+-			if (!NT_SUCCESS(status))
+-			{
+-				break;
+-			}
+-
+-			// Bounds are good... 
+-			if (sectionSize.QuadPart == 0 ||
+-				sectionSize.QuadPart > (static_cast<ULONGLONG>(1024) * 1024 * 32))
+-			{
+-				break;
+-			}
+-
+-			// Now we need the section handle in our process
+-			HANDLE TargetProcessSectionHandle = {};
+-			if (!NT_SUCCESS(status = ZwDuplicateObject(ZwCurrentProcess(),
+-				sectionContext->SectionHandle,
+-				sectionContext->TargetProcessHandle,
+-				&TargetProcessSectionHandle,
+-				0,
+-				0,
+-				DUPLICATE_SAME_ACCESS | DUPLICATE_SAME_ATTRIBUTES | DUPLICATE_CLOSE_SOURCE)))
+-			{
+-				break;
+-			}
+-
+-            // We transferred ownership of the handle to the target process and closed the source
+-            sectionContext->SectionHandle = TargetProcessSectionHandle;
+-            sectionContext->SectionSize = static_cast<ULONG>(sectionSize.QuadPart);
+-				
+-			CommunicationPort::Instance()->SendSectionMessage(sectionContext->SectionHandle,
+-				sectionContext->SectionSize);
++            status = SendFileDataToUserMode(FltObjects->Filter, volumeContext->fltInstance, copyInfo.SourceFileObject);
+ 		}
+ 
+ 	} while (false);
+@@ -342,20 +385,6 @@ FLT_PREOP_CALLBACK_STATUS OnPreWrite(
+         FltReleaseContext(volumeContext);
+ 		volumeContext = nullptr;
+ 	}
+-	if (sectionContext)
+-	{
+-		if (sectionContext->IsSectionCreated())
+-		{
+-			FltCloseSectionForDataScan(sectionContext);
+-		}
+-		FltReleaseContext(sectionContext);
+-        sectionContext = nullptr;
+-	}
+-	if (hProcess)
+-	{
+-		ZwClose(hProcess);
+-		hProcess = nullptr;
+-	}
+ 
+ 	//
+ 	// don't prevent the write regardless
+@@ -381,13 +410,16 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCleanup(_Inout_ PFLT_CALLBACK_DATA Data,
+ 		return FLT_POSTOP_FINISHED_PROCESSING;
+ 	}
+ 
+-	// SendOutputMessage(PortMessageType::FileMessage, L"Cleaning up stream handle context 0x%p", context);
++	CommunicationPort::Instance()->SendOutputMessage(PortMessageType::FileMessage, 
++		L"Cleaning up stream handle context 0x%p", context);
++
+ 	FltReleaseContext(context);
+ 	FltDeleteContext(context);
+ 
+ 	return FLT_POSTOP_FINISHED_PROCESSING;
+ }
+ 
++_IRQL_requires_max_(PASSIVE_LEVEL)
+ FLT_PREOP_CALLBACK_STATUS OnPreClose(
+ 	_Inout_ PFLT_CALLBACK_DATA Data,
+ 	_In_ PCFLT_RELATED_OBJECTS FltObjects,
+@@ -499,7 +531,7 @@ NTSTATUS InitMiniFilter(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPat
+ 		FLT_REGISTRATION const reg = {
+ 			sizeof(FLT_REGISTRATION),
+ 			FLT_REGISTRATION_VERSION,
+-			0,                       //  Flags
++			FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO, //  Flags
+ 			context,                 //  Context
+ 			callbacks,               //  Operation callbacks
+ 			MinifilterUnload,                   //  MiniFilterUnload
+diff --git a/driver/SectionContext.h b/driver/SectionContext.h
+index 139a84be47ae757a04e201c59b2ee9afa5c79545..12c202b484d17b8ce44ba71bc9b83a14f9867005 100644
+--- a/driver/SectionContext.h
++++ b/driver/SectionContext.h
+@@ -41,13 +41,14 @@ public:
+         return SectionHandle != nullptr;
+     }
+ 
+-    static NTSTATUS Factory(_In_ PCFLT_RELATED_OBJECTS FltObjects, 
++    static NTSTATUS Factory(
++        _In_ PFLT_FILTER Filter,
+         _In_ HANDLE ProcessHandle,
+         _Out_ SectionContext** Context)
+     {
+         *Context = nullptr;
+ 
+-        auto status = FltAllocateContext(FltObjects->Filter,
++        auto status = FltAllocateContext(Filter,
+             FLT_SECTION_CONTEXT, sizeof(SectionContext), NonPagedPool,
+             (PFLT_CONTEXT*)Context);
+ 
+
+From f2a766abcb718559a558aee684a336a01667ded0 Mon Sep 17 00:00:00 2001
+From: aallidin <aallidin@cisco.com>
+Date: Fri, 5 Sep 2025 22:39:37 -0400
+Subject: [PATCH] Try to correlate source and destination file in post-create.
+
+---
+ driver/MiniFilter.cpp        | 162 +++++++++++++++++++++++++++++--------------
+ driver/SectionContext.h      |  21 ++++--
+ driver/SourceFileList.h      | 118 +++++++++++++++++++++++++++++++
+ driver/StreamHandleContext.h |   7 +-
+ driver/pooltag.h             |   1 +
+ 5 files changed, 251 insertions(+), 58 deletions(-)
+
+diff --git a/driver/MiniFilter.cpp b/driver/MiniFilter.cpp
+index 259301db6c64bfdda64aefd52d56a2e97b529db8..9ca3d3710ef9068fa2f1f52afd4ddd93ba7d06d2 100644
+--- a/driver/MiniFilter.cpp
++++ b/driver/MiniFilter.cpp
+@@ -17,22 +17,26 @@
+ 
+ #include "DynamicImports.h"
+ #include "Process.h"
++#include "SourceFileList.h"
+ 
+-NTSTATUS MinifilterInstanceSetup(PCFLT_RELATED_OBJECTS FltObjects, FLT_INSTANCE_SETUP_FLAGS Flags, DEVICE_TYPE VolumeDeviceType, FLT_FILESYSTEM_TYPE VolumeFilesystemType) 
++// We can't directly have a static global, since we don't have global new / delete
++SourceFileList* g_SourceFileList;
++
++NTSTATUS MinifilterInstanceSetup(PCFLT_RELATED_OBJECTS FltObjects, FLT_INSTANCE_SETUP_FLAGS Flags, DEVICE_TYPE VolumeDeviceType, FLT_FILESYSTEM_TYPE VolumeFilesystemType)
+ {
+ 	KdPrint((DRIVER_PREFIX "InstanceSetup FS: %u\n", VolumeFilesystemType));
+ 
+ 	UNREFERENCED_PARAMETER(FltObjects);
+ 	UNREFERENCED_PARAMETER(Flags);
+ 	UNREFERENCED_PARAMETER(VolumeDeviceType);
+-    UNREFERENCED_PARAMETER(VolumeFilesystemType);
++	UNREFERENCED_PARAMETER(VolumeFilesystemType);
+ 
+ 	VolumeContext* Context;
+-    auto status = VolumeContext::Factory(FltObjects, &Context);
++	auto status = VolumeContext::Factory(FltObjects, &Context);
+ 	if (!NT_SUCCESS(status))
+ 	{
+-        KdPrint((DRIVER_PREFIX "Failed to allocate volume context (0x%08X)\n", status));
+-        return STATUS_FLT_DO_NOT_ATTACH;
++		KdPrint((DRIVER_PREFIX "Failed to allocate volume context (0x%08X)\n", status));
++		return STATUS_FLT_DO_NOT_ATTACH;
+ 	}
+ 
+ 	if (!NT_SUCCESS(status = VolumeContext::SetContext(FltObjects, Context, true)))
+@@ -45,7 +49,7 @@ NTSTATUS MinifilterInstanceSetup(PCFLT_RELATED_OBJECTS FltObjects, FLT_INSTANCE_
+ 	return NT_SUCCESS(status) ? STATUS_SUCCESS : STATUS_FLT_DO_NOT_ATTACH;
+ }
+ 
+-NTSTATUS MinifilterInstanceQueryTeardown(PCFLT_RELATED_OBJECTS FltObjects, FLT_INSTANCE_QUERY_TEARDOWN_FLAGS Flags) 
++NTSTATUS MinifilterInstanceQueryTeardown(PCFLT_RELATED_OBJECTS FltObjects, FLT_INSTANCE_QUERY_TEARDOWN_FLAGS Flags)
+ {
+ 	UNREFERENCED_PARAMETER(FltObjects);
+ 	UNREFERENCED_PARAMETER(Flags);
+@@ -54,48 +58,65 @@ NTSTATUS MinifilterInstanceQueryTeardown(PCFLT_RELATED_OBJECTS FltObjects, FLT_I
+ 	return STATUS_SUCCESS;
+ }
+ 
+-VOID MinifilterInstanceTeardownStart(PCFLT_RELATED_OBJECTS FltObjects, FLT_INSTANCE_TEARDOWN_FLAGS Flags) 
++VOID MinifilterInstanceTeardownStart(PCFLT_RELATED_OBJECTS FltObjects, FLT_INSTANCE_TEARDOWN_FLAGS Flags)
+ {
+ 	UNREFERENCED_PARAMETER(FltObjects);
+ 	UNREFERENCED_PARAMETER(Flags);
+ }
+ 
+-VOID MinifilterInstanceTeardownComplete(PCFLT_RELATED_OBJECTS FltObjects, FLT_INSTANCE_TEARDOWN_FLAGS Flags) 
++VOID MinifilterInstanceTeardownComplete(PCFLT_RELATED_OBJECTS FltObjects, FLT_INSTANCE_TEARDOWN_FLAGS Flags)
+ {
+ 	UNREFERENCED_PARAMETER(FltObjects);
+ 	UNREFERENCED_PARAMETER(Flags);
+ }
+ 
+-NTSTATUS SendFileDataToUserMode(PFLT_FILTER Filter, PFLT_INSTANCE FltInstance, PFILE_OBJECT FileObject)
++// If FltInstance is NULL, we find it ourselves. Thanks for nothing, buddy.
++NTSTATUS SendFileDataToUserMode(PFLT_INSTANCE FltInstance, PFILE_OBJECT FileObject)
+ {
+ 	NTSTATUS status = STATUS_SUCCESS;
+ 
+ 	SectionContext* sectionContext = {};
+-	HANDLE hProcess = {};
++	VolumeContext* volumeContext = {};
++	HANDLE hKernelSection = {};
++
++	HANDLE hTargetProcess = {};
++	PEPROCESS pTargetProcessObject = {};
+ 
+ 	do
+ 	{
++		if (!FltInstance)
++		{
++			if (!NT_SUCCESS(status = VolumeContext::GetVolumeContextFromFileObject(g_Filter, FileObject, &volumeContext)))
++			{
++				break;
++			}
+ 
+-		if (!NT_SUCCESS(status = CommunicationPort::Instance()->GetConnectedProcessHandle(hProcess)))
++			FltInstance = volumeContext->fltInstance;
++		}
++
++		if (!NT_SUCCESS(status = CommunicationPort::Instance()->GetConnectedProcessHandle(hTargetProcess)) ||
++			!NT_SUCCESS(status = CommunicationPort::Instance()->GetConnectedProcessObject(pTargetProcessObject)))
+ 		{
+ 			// If we're not connected don't go any further.
+ 			break;
+ 		}
+ 
+-		status = SectionContext::Factory(Filter,
+-			hProcess, // SectionContext takes ownership of this handle
++		status = SectionContext::Factory(g_Filter,
++			hTargetProcess, // SectionContext takes ownership of this handle
++			pTargetProcessObject, // SectionContext takes ownership of this object
+ 			&sectionContext);
+ 
+ 		if (!NT_SUCCESS(status))
+ 		{
+ 			break;
+ 		}
+-		hProcess = {};
++		hTargetProcess = {};
++		pTargetProcessObject = {};
+ 
+ 		OBJECT_ATTRIBUTES oa = {};
+ 		InitializeObjectAttributes(&oa,
+ 			NULL,
+-			OBJ_CASE_INSENSITIVE, // user handle
++			OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, // We need a kernel handle so verifier doesn't barf when we duplicate.
+ 			NULL,
+ 			NULL);
+ 
+@@ -109,7 +130,7 @@ NTSTATUS SendFileDataToUserMode(PFLT_FILTER Filter, PFLT_INSTANCE FltInstance, P
+ 			PAGE_READONLY,
+ 			SEC_COMMIT,
+ 			0,
+-			&sectionContext->SectionHandle,
++			&hKernelSection,
+ 			&sectionContext->SectionObject,
+ 			&sectionSize);
+ 
+@@ -118,35 +139,41 @@ NTSTATUS SendFileDataToUserMode(PFLT_FILTER Filter, PFLT_INSTANCE FltInstance, P
+ 			break;
+ 		}
+ 
+-		// Bounds are good... 
++		// Bounds checking is a good idea...
+ 		if (sectionSize.QuadPart == 0 ||
+-			sectionSize.QuadPart > (static_cast<ULONGLONG>(1024) * 1024 * 32))
++			sectionSize.QuadPart > (static_cast<ULONGLONG>(1024) * 1024 * 32)) // 32MB
+ 		{
+ 			break;
+ 		}
+ 
+-		// Now we need the section handle in our process
+-		HANDLE TargetProcessSectionHandle = {};
++		sectionContext->SectionSize = static_cast<ULONG>(sectionSize.QuadPart);
++
++		// Now duplicate the handle into our user mode process
+ 		if (!NT_SUCCESS(status = ZwDuplicateObject(ZwCurrentProcess(),
+-			sectionContext->SectionHandle,
++			hKernelSection,
+ 			sectionContext->TargetProcessHandle,
+-			&TargetProcessSectionHandle,
++			&sectionContext->SectionHandle,
+ 			0,
+ 			0,
+-			DUPLICATE_SAME_ACCESS | DUPLICATE_SAME_ATTRIBUTES | DUPLICATE_CLOSE_SOURCE)))
++			DUPLICATE_SAME_ACCESS)))
+ 		{
+ 			break;
+ 		}
+ 
+-		// We transferred ownership of the handle to the target process and closed the source
+-		sectionContext->SectionHandle = TargetProcessSectionHandle;
+-		sectionContext->SectionSize = static_cast<ULONG>(sectionSize.QuadPart);
+-
+-		CommunicationPort::Instance()->SendSectionMessage(sectionContext->SectionHandle,
+-			sectionContext->SectionSize);
++		if (NT_SUCCESS(status = CommunicationPort::Instance()->SendSectionMessage(sectionContext->SectionHandle,
++			sectionContext->SectionSize)))
++		{
++			// User mode is responsible for closing the section handle now.
++            sectionContext->SectionHandle = nullptr;
++		}
+ 
+ 	} while (false);
+ 
++	if (volumeContext)
++	{
++		FltReleaseContext(volumeContext);
++	}
++
+ 	if (sectionContext)
+ 	{
+ 		if (sectionContext->IsSectionCreated())
+@@ -157,10 +184,22 @@ NTSTATUS SendFileDataToUserMode(PFLT_FILTER Filter, PFLT_INSTANCE FltInstance, P
+ 		sectionContext = nullptr;
+ 	}
+ 
+-	if (hProcess)
++	if (hTargetProcess)
++	{
++		ZwClose(hTargetProcess);
++		hTargetProcess = nullptr;
++	}
++
++	if (hKernelSection)
++	{
++		ZwClose(hKernelSection);
++		hKernelSection = nullptr;
++	}
++
++	if (pTargetProcessObject)
+ 	{
+-		ZwClose(hProcess);
+-		hProcess = nullptr;
++        ObDereferenceObject(pTargetProcessObject);
++        pTargetProcessObject = nullptr;
+ 	}
+ 
+ 	return status;
+@@ -176,6 +215,7 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 	UNREFERENCED_PARAMETER(disposition); // I always forget how to do this. Keep it around.
+ 
+ 	const ULONG desiredAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
++	PFILE_OBJECT PotentialSourceFileObject = {};
+ 
+ 	// 
+ 	// Basic things to ignore 
+@@ -221,6 +261,9 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 		{
+ 			return FLT_POSTOP_FINISHED_PROCESSING;
+ 		}
++
++        PotentialSourceFileObject = g_SourceFileList->Find(HandleToUlong(PsGetCurrentProcessId()),
++            HandleToUlong(PsGetCurrentThreadId()));
+ 	}
+ 	else if (DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopySource(FltObjects->FileObject))
+ 	{
+@@ -228,6 +271,13 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 		{
+ 			return FLT_POSTOP_FINISHED_PROCESSING;
+ 		}
++
++		// This may be used as a source file later. By observation, sometimes, Explorer opens the same
++		// file multiple times (seen on network). In that case, we'll have more than one entry in the list for
++		// this PID and TID. A better method might be to filter by fscontext.
++        g_SourceFileList->AddFirst(HandleToUlong(PsGetCurrentProcessId()), 
++								   HandleToUlong(PsGetCurrentThreadId()), 
++								   FltObjects->FileObject);
+ 	}
+ 	else
+ 	{
+@@ -272,6 +322,12 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 			DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopySource(FltObjects->FileObject) ? L"\n\tOpened with copy source flag" : L"");
+ 	}
+ 
++	if (PotentialSourceFileObject)
++	{
++		// We don't know the correct instance for this FO. It's OK.
++		status = SendFileDataToUserMode(nullptr, PotentialSourceFileObject);
++	}
++
+ 	//
+ 	// release context in all cases
+ 	//
+@@ -343,8 +399,8 @@ FLT_PREOP_CALLBACK_STATUS OnPreWrite(
+ 			// This is always called in the SYSTEM process it seems.
+ 			CommunicationPort::Instance()->SendOutputMessage(PortMessageType::FileMessage,
+ 				L"%wZ (%u, %u): Copy Notification (pos=%u, len=%u)\n\tDestination: %wZ (SH=%p)\n\tSource: %wZ",
+-                &processName, 
+-				HandleToULong(PsGetCurrentProcessId()), 
++				&processName,
++				HandleToULong(PsGetCurrentProcessId()),
+ 				HandleToULong(PsGetCurrentThreadId()),
+ 				Parameters.ByteOffset, Parameters.Length,
+ 				&destinationName->Name,
+@@ -353,19 +409,6 @@ FLT_PREOP_CALLBACK_STATUS OnPreWrite(
+ 
+ 			Locker locker(contextSrc->Lock);
+ 			contextSrc->m_writeCount++;
+-
+-			if (contextSrc->m_writeCount > 1)
+-			{
+-				// Not the first write.
+-				break;
+-			}
+-
+-			//
+-			// This is the first chunk of the copy - let user mode know about it.
+-			// TODO: When testing on the network, I noticed multiple chunks being written in parallel.
+-			// Look at locking and see if it is adequate to handle this.
+-			//
+-            status = SendFileDataToUserMode(FltObjects->Filter, volumeContext->fltInstance, copyInfo.SourceFileObject);
+ 		}
+ 
+ 	} while (false);
+@@ -382,7 +425,7 @@ FLT_PREOP_CALLBACK_STATUS OnPreWrite(
+ 	}
+ 	if (volumeContext)
+ 	{
+-        FltReleaseContext(volumeContext);
++		FltReleaseContext(volumeContext);
+ 		volumeContext = nullptr;
+ 	}
+ 
+@@ -392,16 +435,21 @@ FLT_PREOP_CALLBACK_STATUS OnPreWrite(
+ 	return FLT_PREOP_SUCCESS_NO_CALLBACK;
+ }
+ 
+-FLT_POSTOP_CALLBACK_STATUS OnPostCleanup(_Inout_ PFLT_CALLBACK_DATA Data, 
+-	_In_ PCFLT_RELATED_OBJECTS FltObjects, 
+-	_In_opt_ PVOID, 
+-	_In_ FLT_POST_OPERATION_FLAGS Flags) 
++FLT_POSTOP_CALLBACK_STATUS OnPostCleanup(_Inout_ PFLT_CALLBACK_DATA Data,
++	_In_ PCFLT_RELATED_OBJECTS FltObjects,
++	_In_opt_ PVOID,
++	_In_ FLT_POST_OPERATION_FLAGS Flags)
+ {
+ 	UNREFERENCED_PARAMETER(Flags);
+ 	UNREFERENCED_PARAMETER(Data);
+ 
+ 	StreamHandleContext* context;
+ 
++	if (DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopySource(FltObjects->FileObject))
++	{
++        g_SourceFileList->Remove(FltObjects->FileObject);
++	}
++
+ 	auto status = FltGetStreamHandleContext(FltObjects->Instance, FltObjects->FileObject, (PFLT_CONTEXT*)&context);
+ 	if (!NT_SUCCESS(status) || context == nullptr) {
+ 		//
+@@ -439,6 +487,11 @@ NTSTATUS InitMiniFilter(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPat
+ 	NTSTATUS status;
+ 	do 
+ 	{
++		//
++		// Set up our list
++		// 
++		g_SourceFileList = new SourceFileList();
++
+ 		//
+ 		// add registry data for proper mini-filter registration
+ 		//
+@@ -566,8 +619,11 @@ NTSTATUS MinifilterUnload(FLT_FILTER_UNLOAD_FLAGS Flags)
+ {
+ 	UNREFERENCED_PARAMETER(Flags);
+ 
++
++	delete g_SourceFileList;
+ 	CommunicationPort::Instance()->FinalizeFilterPort();
+ 	FltUnregisterFilter(g_Filter);
+ 
+ 	return STATUS_SUCCESS;
+-}
+\ No newline at end of file
++}
++
+diff --git a/driver/SectionContext.h b/driver/SectionContext.h
+index 12c202b484d17b8ce44ba71bc9b83a14f9867005..a1ae60f8e5d85d12479c4cd2486430945decf4e4 100644
+--- a/driver/SectionContext.h
++++ b/driver/SectionContext.h
+@@ -8,18 +8,25 @@ public:
+     ULONG SectionSize = {};
+ 
+     HANDLE TargetProcessHandle = {};
++    PEPROCESS TargetProcessObject = {}; // For closing the section handle later on
+ 
+     // We take ownership of the handle, to prevent races.
+-    SectionContext(HANDLE ProcessHandle)
++    SectionContext(HANDLE ProcessHandle, PEPROCESS ProcessObject)
+     {
+         TargetProcessHandle = ProcessHandle;
++        TargetProcessObject = ProcessObject;
+     }
+ 
+     ~SectionContext()
+     {
+         if (SectionHandle)
+         {
+-            ZwClose(SectionHandle);
++            // SectionHandle is in our user mode process handle table.
++            KAPC_STATE apcState;
++            KeStackAttachProcess(TargetProcessObject, &apcState);
++            // ZwClose does not like user mode handles in kernel. Verifier barfs.
++            ObCloseHandle(SectionHandle, UserMode);
++            KeUnstackDetachProcess(&apcState);
+             SectionHandle = nullptr;
+         }
+ 
+@@ -34,16 +41,22 @@ public:
+             ZwClose(TargetProcessHandle);
+             TargetProcessHandle = nullptr;
+         }
++
++        if (TargetProcessObject)
++        {
++            ObfDereferenceObject(TargetProcessObject);
++        }
+     }
+ 
+     bool IsSectionCreated() const
+     {
+-        return SectionHandle != nullptr;
++        return SectionObject != nullptr;
+     }
+ 
+     static NTSTATUS Factory(
+         _In_ PFLT_FILTER Filter,
+         _In_ HANDLE ProcessHandle,
++        _In_ PEPROCESS ProcessObject,
+         _Out_ SectionContext** Context)
+     {
+         *Context = nullptr;
+@@ -57,7 +70,7 @@ public:
+         }
+ 
+         // Placement new
+-        new (*Context) SectionContext(ProcessHandle);
++        new (*Context) SectionContext(ProcessHandle, ProcessObject);
+ 
+         return STATUS_SUCCESS;
+     }
+diff --git a/driver/SourceFileList.h b/driver/SourceFileList.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..8a19d2ce85509907cb35a4f9443e85bbc5626efd
+--- /dev/null
++++ b/driver/SourceFileList.h
+@@ -0,0 +1,118 @@
++#pragma once
++
++#include "LinkedList.h"
++
++struct SourceFileEntry
++{
++    LIST_ENTRY   Link; // For LinkedList
++    ULONG        ProcessId;
++    ULONG        ThreadId;
++    PFILE_OBJECT FileObject;
++};
++
++class SourceFileList 
++{
++
++public:     
++    SourceFileList()
++    {
++        m_List.Init();
++    }
++    ~SourceFileList()
++    {
++        while (!m_List.IsEmpty())
++        {
++            auto entry = m_List.RemoveHead();
++            ExFreePoolWithTag(entry, SOURCEFILE_POOLTAG);
++        }
++        m_List.Finalize();
++    }
++
++    bool AddFirst(ULONG processId, ULONG threadId, PFILE_OBJECT fileObject)
++    {
++        auto entry = (SourceFileEntry*)ExAllocatePool2(POOL_FLAG_PAGED, sizeof(SourceFileEntry), SOURCEFILE_POOLTAG);
++        if (!entry)
++        {
++            return false;
++        }
++
++        entry->ProcessId = processId;
++        entry->ThreadId = threadId;
++        entry->FileObject = fileObject;
++
++        // Let's be careful about lifetimes...
++        ObReferenceObject(fileObject);
++        m_List.AddHead(entry);
++
++        return true;
++    }
++
++    bool Remove(PFILE_OBJECT fileObject)
++    {
++        SourceFileEntry* entry = m_List.Find([fileObject](SourceFileEntry* e) 
++            { return e->FileObject == fileObject; });
++
++        if (entry)
++        {
++            m_List.RemoveItem(entry);
++            ObDereferenceObject(fileObject); // We added a reference in AddFirst
++            ExFreePoolWithTag(entry, SOURCEFILE_POOLTAG);
++            return true;
++        }
++
++        return false;
++    }
++
++    PFILE_OBJECT Find(ULONG processId, ULONG threadId)
++    {
++        SourceFileEntry* entry = m_List.Find([processId, threadId](SourceFileEntry* e)
++            { return e->ProcessId == processId && e->ThreadId == threadId; });
++
++        if (entry)
++        {
++            // Sanity check - make sure we don't have duplicate open source files for this pid/tid. It's OK
++            // if we have multiple FOs for the same file (it's not clear that this happens in practice but...)
++            // 
++            // We use a file system trick for our sanity -- all FOs that point to the same stream
++            // have the same FsContext pointer. This is not quite true for network, but true enough
++            // for our purposes.
++            m_List.ForEach([processId, threadId, entry](SourceFileEntry* e)
++            {
++                if (e->ProcessId == processId && e->ThreadId == threadId)
++                {
++                    if (entry->FileObject->FsContext != e->FileObject->FsContext)
++                    {
++                        CommunicationPort::Instance()->SendOutputMessage(PortMessageType::FileMessage,
++                            L"Warning: Multiple source files found for PID %u TID %u - FsContext mismatch (0x%p vs 0x%p)",
++                            processId,
++                            threadId,
++                            entry->FileObject->FsContext,
++                            e->FileObject->FsContext);
++                    }
++                }
++            });
++
++            return entry->FileObject;
++        }
++
++        return nullptr;
++    }
++
++    void* operator new (size_t s)
++    {
++        // Need nonpaged for synch object - verifier complains
++        return ExAllocatePool2(POOL_FLAG_NON_PAGED, s, SOURCEFILE_POOLTAG);
++    }
++
++    void operator delete(void* p)
++    {
++        if (p)
++        {
++            ExFreePoolWithTag(p, SOURCEFILE_POOLTAG);
++        }
++    }
++
++private:
++
++    LinkedList<SourceFileEntry> m_List;
++};
+diff --git a/driver/StreamHandleContext.h b/driver/StreamHandleContext.h
+index afe1b129fa886de28770cfe612f9412dddde439e..c9ce9204a853ffb02fae18d402ef8d5f87827993 100644
+--- a/driver/StreamHandleContext.h
++++ b/driver/StreamHandleContext.h
+@@ -6,12 +6,17 @@ public:
+     LARGE_INTEGER m_firstWriteTime = {};
+     ULONGLONG m_writeCount = {};
+     Mutex Lock;
++    bool AddedToSourceList = {};
+ 
+     StreamHandleContext()
+     {
+         Lock.Init();
+     }
+ 
++    ~StreamHandleContext()
++    {
++    }
++
+     static NTSTATUS Factory(_In_ PCFLT_RELATED_OBJECTS FltObjects, _Out_ StreamHandleContext** Context)
+     {
+         *Context = nullptr;
+@@ -57,7 +62,7 @@ public:
+             return;
+         }
+         auto ctx = reinterpret_cast<StreamHandleContext*>(Context);
+-        UNREFERENCED_PARAMETER(ctx);
++        ctx->~StreamHandleContext();
+         return;
+     }
+ };
+\ No newline at end of file
+diff --git a/driver/pooltag.h b/driver/pooltag.h
+index 0d7a35920e684b2854204f8d07011baeb0951069..c021b5fdd9e7618b3dd9642725c660c788f42328 100644
+--- a/driver/pooltag.h
++++ b/driver/pooltag.h
+@@ -6,3 +6,4 @@
+ #define STREAMHANDLE_POOLTAG 'hsAA'
+ #define STREAM_POOLTAG 'tsAA'
+ #define SECTION_POOLTAG 'csAA'
++#define SOURCEFILE_POOLTAG 'fsAA'
+
+From e901e03cfa4134eef283a192679025c794960c51 Mon Sep 17 00:00:00 2001
+From: aallidin <aallidin@cisco.com>
+Date: Fri, 5 Sep 2025 22:44:58 -0400
+Subject: [PATCH] Comments.
+
+---
+ driver/MiniFilter.cpp | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/driver/MiniFilter.cpp b/driver/MiniFilter.cpp
+index 9ca3d3710ef9068fa2f1f52afd4ddd93ba7d06d2..75bc3d0aed28ac30e04fd2f5670cbf4774e14366 100644
+--- a/driver/MiniFilter.cpp
++++ b/driver/MiniFilter.cpp
+@@ -262,6 +262,9 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 			return FLT_POSTOP_FINISHED_PROCESSING;
+ 		}
+ 
++		// The FO is being opened as a copy destination. This may or may not prove to be true.
++		// We don't know the source, but by observation, CopyFile opens it first so we should have it 
++		// in our list.
+         PotentialSourceFileObject = g_SourceFileList->Find(HandleToUlong(PsGetCurrentProcessId()),
+             HandleToUlong(PsGetCurrentThreadId()));
+ 	}
+@@ -272,9 +275,8 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 			return FLT_POSTOP_FINISHED_PROCESSING;
+ 		}
+ 
+-		// This may be used as a source file later. By observation, sometimes, Explorer opens the same
+-		// file multiple times (seen on network). In that case, we'll have more than one entry in the list for
+-		// this PID and TID. A better method might be to filter by fscontext.
++		// This FO is being opened as a copy source. This may or may not prove to be true.
++		// By observation, Explorer will sometimes open with this flag set and then close the file before copying anything.
+         g_SourceFileList->AddFirst(HandleToUlong(PsGetCurrentProcessId()), 
+ 								   HandleToUlong(PsGetCurrentThreadId()), 
+ 								   FltObjects->FileObject);
+@@ -324,6 +326,7 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 
+ 	if (PotentialSourceFileObject)
+ 	{
++		// We think we know the source that will be copied to the current FO. Let user mode know.
+ 		// We don't know the correct instance for this FO. It's OK.
+ 		status = SendFileDataToUserMode(nullptr, PotentialSourceFileObject);
+ 	}
+
+From a8600a792df4cfa4b7c7d6f8e98cc5d8b4489074 Mon Sep 17 00:00:00 2001
+From: aallidin <aallidin@cisco.com>
+Date: Sun, 14 Sep 2025 21:24:57 -0400
+Subject: [PATCH] Add the ability to block a copy.
+
+---
+ driver/Common.h          | 10 ++++++++++
+ driver/Communication.cpp | 17 ++++++++++++++---
+ driver/Communication.h   |  4 +++-
+ driver/MiniFilter.cpp    | 25 +++++++++++++++++++++----
+ 4 files changed, 48 insertions(+), 8 deletions(-)
+
+diff --git a/driver/Common.h b/driver/Common.h
+index f086dcd07f9a131ee275f26a904acf6793df4547..6650133602068343007a0163477962704620e5af 100644
+--- a/driver/Common.h
++++ b/driver/Common.h
+@@ -28,6 +28,16 @@ struct PortMessage {
+ 	};
+ };
+ 
++struct PortReply {
++	NTSTATUS status;
++};
++
++struct PortReplyMessage {
++	FILTER_REPLY_HEADER header;
++	PortReply reply;
++};
++
+ #define FILTER_PORT_NAME L"\\CopyDetectPort"
+ 
+ constexpr ULONG COMMUNICATION_BUFFER_LEN = 1 << 15; // 32 KB
++constexpr ULONG PortReplyMessageSize = sizeof(FILTER_REPLY_HEADER) + sizeof(PortReply);
+diff --git a/driver/Communication.cpp b/driver/Communication.cpp
+index a341f2e8c5d214c27419ff25def0671e81507785..a744c82e1184ea9e29bb38424c887171338784fb 100644
+--- a/driver/Communication.cpp
++++ b/driver/Communication.cpp
+@@ -137,9 +137,12 @@ NTSTATUS CommunicationPort::GetConnectedProcessObject(PEPROCESS& process) const
+     return status;
+ }
+ 
+-NTSTATUS CommunicationPort::SendSectionMessage(_In_ HANDLE SectionHandle, _In_ ULONG FileSizeBytes)
++NTSTATUS CommunicationPort::SendSectionMessage(_In_ HANDLE SectionHandle, 
++	_In_ ULONG FileSizeBytes,
++	_Out_ NTSTATUS& userReply)
+ {
+ 	NTSTATUS status = STATUS_CONNECTION_INVALID;
++	userReply = STATUS_SUCCESS;
+ 
+ 	if (IsConnected())
+ 	{
+@@ -155,17 +158,25 @@ NTSTATUS CommunicationPort::SendSectionMessage(_In_ HANDLE SectionHandle, _In_ U
+             msg->sectionMsg.fileSizeBytes = FileSizeBytes;
+ 			msg->sectionMsg.sectionHandle = SectionHandle;
+ 
++			PortReply reply = {};
++            ULONG replyLength = sizeof(reply);
++
+ 			// LARGE_INTEGER timeout;
+ 			// timeout.QuadPart = -10000 * 100; // 100 msec
+ 			status = FltSendMessage(m_Filter,
+ 				&m_ClientPort,
+ 				msg,
+ 				sizeof(PortMessage),
+-				nullptr,
+-				nullptr,
++				&reply,
++				&replyLength,
+ 				nullptr);
+ 
+ 			ExFreePool(msg);
++
++			if (NT_SUCCESS(status))
++			{
++				userReply = reply.status;
++			}
+ 		}
+ 		else
+ 		{
+diff --git a/driver/Communication.h b/driver/Communication.h
+index 97557207d5e457e3742321bdf7aa23129d945324..6e66cb3bedb4149a48e9647f8616e8f08162eada 100644
+--- a/driver/Communication.h
++++ b/driver/Communication.h
+@@ -33,7 +33,9 @@ public:
+ 		_Out_ PULONG ReturnOutputBufferLength);
+ 
+ 	NTSTATUS SendOutputMessage(_In_ PortMessageType type, _In_ LPCWSTR formatString, ...);
+-	NTSTATUS SendSectionMessage(_In_ HANDLE Sectionhandle, _In_ ULONG FileSizeBytes);
++	NTSTATUS SendSectionMessage(_In_ HANDLE Sectionhandle, 
++		_In_ ULONG FileSizeBytes,
++		_Out_ NTSTATUS& UserReply);
+ 
+     ULONG GetConnectedPID() const { return m_ConnectedPID; }
+ 
+diff --git a/driver/MiniFilter.cpp b/driver/MiniFilter.cpp
+index 75bc3d0aed28ac30e04fd2f5670cbf4774e14366..a6ff631de7b8ce4b19372211173218a2c819a6ad 100644
+--- a/driver/MiniFilter.cpp
++++ b/driver/MiniFilter.cpp
+@@ -71,9 +71,12 @@ VOID MinifilterInstanceTeardownComplete(PCFLT_RELATED_OBJECTS FltObjects, FLT_IN
+ }
+ 
+ // If FltInstance is NULL, we find it ourselves. Thanks for nothing, buddy.
+-NTSTATUS SendFileDataToUserMode(PFLT_INSTANCE FltInstance, PFILE_OBJECT FileObject)
++NTSTATUS SendFileDataToUserMode(PFLT_INSTANCE FltInstance, 
++	PFILE_OBJECT FileObject,
++	NTSTATUS& UserReply)
+ {
+ 	NTSTATUS status = STATUS_SUCCESS;
++	UserReply = STATUS_SUCCESS;
+ 
+ 	SectionContext* sectionContext = {};
+ 	VolumeContext* volumeContext = {};
+@@ -161,7 +164,8 @@ NTSTATUS SendFileDataToUserMode(PFLT_INSTANCE FltInstance, PFILE_OBJECT FileObje
+ 		}
+ 
+ 		if (NT_SUCCESS(status = CommunicationPort::Instance()->SendSectionMessage(sectionContext->SectionHandle,
+-			sectionContext->SectionSize)))
++			sectionContext->SectionSize,
++			UserReply)))
+ 		{
+ 			// User mode is responsible for closing the section handle now.
+             sectionContext->SectionHandle = nullptr;
+@@ -217,11 +221,13 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 	const ULONG desiredAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+ 	PFILE_OBJECT PotentialSourceFileObject = {};
+ 
++	NTSTATUS postCreateResult = STATUS_SUCCESS;
++
+ 	// 
+ 	// Basic things to ignore 
+ 	//
+ 	if (Flags & FLTFL_POST_OPERATION_DRAINING || 
+-		Data->IoStatus.Status != STATUS_SUCCESS ||
++		Data->IoStatus.Status != STATUS_SUCCESS || // handles STATUS_REPARSE as well
+ 		IoGetTopLevelIrp() != nullptr ||
+ 		Data->RequestorMode == KernelMode)
+ 	{
+@@ -328,7 +334,7 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 	{
+ 		// We think we know the source that will be copied to the current FO. Let user mode know.
+ 		// We don't know the correct instance for this FO. It's OK.
+-		status = SendFileDataToUserMode(nullptr, PotentialSourceFileObject);
++		status = SendFileDataToUserMode(nullptr, PotentialSourceFileObject, postCreateResult);
+ 	}
+ 
+ 	//
+@@ -336,6 +342,17 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 	//
+ 	FltReleaseContext(context);
+ 
++	if (!NT_SUCCESS(postCreateResult))
++	{
++		// We were told to deny this open - if it was a CREATE or a destructive
++		// open, we're left with a 0-byte file. Not important for the POC, but 
++		// something to consider. We could avoid this by handling the whole thing in
++		// pre-create. We just have to be a bit more careful about the calls we make.
++		FltCancelFileOpen(FltObjects->Instance, FltObjects->FileObject);
++		Data->IoStatus.Status = postCreateResult;
++		Data->IoStatus.Information = 0;
++	}
++
+ 	return FLT_POSTOP_FINISHED_PROCESSING;
+ }
+ 
+
+From 7945edf755d46a2f84eb2d3d8f918c8e55873192 Mon Sep 17 00:00:00 2001
+From: aallidin <aallidin@cisco.com>
+Date: Mon, 15 Sep 2025 13:30:19 -0400
+Subject: [PATCH] Block the copy in pre-create, so that we don't create the
+ destination file.
+
+---
+ driver/MiniFilter.cpp | 148 +++++++++++++++++++++++++++++++-------------------
+ 1 file changed, 91 insertions(+), 57 deletions(-)
+
+diff --git a/driver/MiniFilter.cpp b/driver/MiniFilter.cpp
+index a6ff631de7b8ce4b19372211173218a2c819a6ad..2998b50e3ff62239bfbde3bbe0a66b6b208a7add 100644
+--- a/driver/MiniFilter.cpp
++++ b/driver/MiniFilter.cpp
+@@ -167,8 +167,8 @@ NTSTATUS SendFileDataToUserMode(PFLT_INSTANCE FltInstance,
+ 			sectionContext->SectionSize,
+ 			UserReply)))
+ 		{
+-			// User mode is responsible for closing the section handle now.
+-            sectionContext->SectionHandle = nullptr;
++			// Driver owns the handle in all cases, since the call to UM is synchronous now.
++            // sectionContext->SectionHandle = nullptr;
+ 		}
+ 
+ 	} while (false);
+@@ -209,42 +209,101 @@ NTSTATUS SendFileDataToUserMode(PFLT_INSTANCE FltInstance,
+ 	return status;
+ }
+ 
+-_IRQL_requires_max_(PASSIVE_LEVEL)
+-FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data, 
+-	_In_ PCFLT_RELATED_OBJECTS FltObjects, 
+-	_In_opt_ PVOID, 
+-	_In_ FLT_POST_OPERATION_FLAGS Flags) 
++_IRQL_requires_max_(APC_LEVEL)
++FLT_PREOP_CALLBACK_STATUS OnPreCreate(
++	_Inout_ PFLT_CALLBACK_DATA Data,
++	_In_ PCFLT_RELATED_OBJECTS FltObjects,
++	_Outptr_result_maybenull_ PVOID* CompletionContext)
+ {
+-	const ULONG disposition = (Data->Iopb->Parameters.Create.Options >> 24) & 0xff;
+-	UNREFERENCED_PARAMETER(disposition); // I always forget how to do this. Keep it around.
+-
+ 	const ULONG desiredAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+-	PFILE_OBJECT PotentialSourceFileObject = {};
+-
+-	NTSTATUS postCreateResult = STATUS_SUCCESS;
++	*CompletionContext = nullptr;
+ 
++	// In pre-create, we can ignore some easy things.
+ 	// 
+-	// Basic things to ignore 
+-	//
+-	if (Flags & FLTFL_POST_OPERATION_DRAINING || 
+-		Data->IoStatus.Status != STATUS_SUCCESS || // handles STATUS_REPARSE as well
+-		IoGetTopLevelIrp() != nullptr ||
++	// We also want to detect copy intention here so that we can block before the 
++	// file is created.
++	if (IoGetTopLevelIrp() != nullptr ||
+ 		Data->RequestorMode == KernelMode)
+ 	{
+-		return FLT_POSTOP_FINISHED_PROCESSING;
++		return FLT_PREOP_SUCCESS_NO_CALLBACK;
+ 	}
+ 
+ 	if (HandleToUlong(PsGetCurrentProcessId()) == CommunicationPort::Instance()->GetConnectedPID())
+-    {
+-        // Don't care about our own activity
+-        return FLT_POSTOP_FINISHED_PROCESSING;
+-    }
++	{
++		// Don't care about our own activity
++		return FLT_PREOP_SUCCESS_NO_CALLBACK;
++	}
+ 
+ 	//
+ 	// Ignore attribute opens to save a *lot* of useless processing.
+ 	//
+-	if (Data->IoStatus.Information == FILE_OPENED && 
++	if (Data->IoStatus.Information == FILE_OPENED &&
+ 		((desiredAccess & ~(SYNCHRONIZE | FILE_READ_ATTRIBUTES)) == 0))
++	{
++		return FLT_PREOP_SUCCESS_NO_CALLBACK;
++	}
++
++	if (DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopyDestination(FltObjects->FileObject))
++	{
++		if (0 == (desiredAccess & FILE_WRITE_DATA))
++		{
++			return FLT_PREOP_SUCCESS_NO_CALLBACK;
++		}
++
++		// The FO is being opened as a copy destination. This may or may not prove to be true.
++		// We don't know the source, but by observation, CopyFile opens it first so we should have it 
++		// in our list.
++		PFILE_OBJECT PotentialSourceFileObject = g_SourceFileList->Find(HandleToUlong(PsGetCurrentProcessId()),
++			HandleToUlong(PsGetCurrentThreadId()));
++
++		if (PotentialSourceFileObject)
++		{
++			// We think we know the source that will be copied to the current FO. Let user mode know.
++			// We don't know the correct instance for this FO. It's OK.
++            NTSTATUS userResult = STATUS_SUCCESS;
++			auto status = SendFileDataToUserMode(nullptr, PotentialSourceFileObject, userResult);
++
++			if (NT_SUCCESS(status) && !NT_SUCCESS(userResult))
++			{
++				UnicodeString processName;
++				Process p(PsGetCurrentProcess());
++				p.GetImageFileNameOnly(processName);
++
++				CommunicationPort::Instance()->SendOutputMessage(PortMessageType::FileMessage,
++					L"%wZ (%u,%u): Blocking copy to %wZ with code 0x%x",
++					processName.Get(),
++                    HandleToUlong(PsGetCurrentProcessId()),
++                    HandleToUlong(PsGetCurrentThreadId()),
++                    &FilterFileNameInformation(Data).Get()->Name,
++					userResult);
++
++				// User has asked us to block this.
++				Data->IoStatus.Status = userResult;
++				Data->IoStatus.Information = 0;
++				return FLT_PREOP_COMPLETE;
++			}
++		}
++	}
++
++	return FLT_PREOP_SUCCESS_WITH_CALLBACK;
++}
++
++_IRQL_requires_max_(PASSIVE_LEVEL)
++FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data, 
++	_In_ PCFLT_RELATED_OBJECTS FltObjects, 
++	_In_opt_ PVOID, 
++	_In_ FLT_POST_OPERATION_FLAGS Flags) 
++{
++	const ULONG disposition = (Data->Iopb->Parameters.Create.Options >> 24) & 0xff;
++	UNREFERENCED_PARAMETER(disposition); // I always forget how to do this. Keep it around.
++
++	const ULONG desiredAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
++
++	// 
++	// Basic things to ignore 
++	//
++	if (Flags & FLTFL_POST_OPERATION_DRAINING ||
++		Data->IoStatus.Status != STATUS_SUCCESS) // handles STATUS_REPARSE as well
+ 	{
+ 		return FLT_POSTOP_FINISHED_PROCESSING;
+ 	}
+@@ -259,22 +318,10 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 	}
+ 
+ 	//
+-	// We only care about copying in this POC.
++	// We only care about copying in this POC. We handled the destination in pre-create.
++	// Look for the source now.
+ 	//
+-	if (DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopyDestination(FltObjects->FileObject))
+-	{
+-		if (0 == (desiredAccess & FILE_WRITE_DATA))
+-		{
+-			return FLT_POSTOP_FINISHED_PROCESSING;
+-		}
+-
+-		// The FO is being opened as a copy destination. This may or may not prove to be true.
+-		// We don't know the source, but by observation, CopyFile opens it first so we should have it 
+-		// in our list.
+-        PotentialSourceFileObject = g_SourceFileList->Find(HandleToUlong(PsGetCurrentProcessId()),
+-            HandleToUlong(PsGetCurrentThreadId()));
+-	}
+-	else if (DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopySource(FltObjects->FileObject))
++	if (DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopySource(FltObjects->FileObject))
+ 	{
+ 		if (0 == (desiredAccess & FILE_READ_DATA))
+ 		{
+@@ -330,28 +377,15 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 			DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopySource(FltObjects->FileObject) ? L"\n\tOpened with copy source flag" : L"");
+ 	}
+ 
+-	if (PotentialSourceFileObject)
+-	{
+-		// We think we know the source that will be copied to the current FO. Let user mode know.
+-		// We don't know the correct instance for this FO. It's OK.
+-		status = SendFileDataToUserMode(nullptr, PotentialSourceFileObject, postCreateResult);
+-	}
+-
+ 	//
+ 	// release context in all cases
+ 	//
+ 	FltReleaseContext(context);
+ 
+-	if (!NT_SUCCESS(postCreateResult))
+-	{
+-		// We were told to deny this open - if it was a CREATE or a destructive
+-		// open, we're left with a 0-byte file. Not important for the POC, but 
+-		// something to consider. We could avoid this by handling the whole thing in
+-		// pre-create. We just have to be a bit more careful about the calls we make.
+-		FltCancelFileOpen(FltObjects->Instance, FltObjects->FileObject);
+-		Data->IoStatus.Status = postCreateResult;
+-		Data->IoStatus.Information = 0;
+-	}
++	// If one were to block here, we also need to cancel the open, since it already succeeded.
++	//FltCancelFileOpen(FltObjects->Instance, FltObjects->FileObject);
++	//Data->IoStatus.Status = postCreateResult;
++	//Data->IoStatus.Information = 0;	
+ 
+ 	return FLT_POSTOP_FINISHED_PROCESSING;
+ }
+@@ -585,7 +619,7 @@ NTSTATUS InitMiniFilter(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPat
+         hSubKey = nullptr;
+ 
+ 		FLT_OPERATION_REGISTRATION const callbacks[] = {
+-			{ IRP_MJ_CREATE, 0, nullptr, OnPostCreate },
++			{ IRP_MJ_CREATE, 0, OnPreCreate, OnPostCreate },
+ 			{ IRP_MJ_WRITE, 0, OnPreWrite },
+ 			{ IRP_MJ_CLEANUP, 0, nullptr, OnPostCleanup },
+ 			{ IRP_MJ_CLOSE, 0, OnPreClose, nullptr },
+
+From c7919e0223865977f78fe342cd3258887d936ec2 Mon Sep 17 00:00:00 2001
+From: aallidin <aallidin@cisco.com>
+Date: Tue, 16 Sep 2025 13:01:11 -0400
+Subject: [PATCH] Add caching of the user mode verdict, since CopyFile likes to
+ retry things.
+
+---
+ driver/MiniFilter.cpp   | 86 ++++++++++++++++++++++++++++++++++++++++---------
+ driver/SourceFileList.h | 62 ++++++++++++++++++++++++++++-------
+ 2 files changed, 121 insertions(+), 27 deletions(-)
+
+diff --git a/driver/MiniFilter.cpp b/driver/MiniFilter.cpp
+index 2998b50e3ff62239bfbde3bbe0a66b6b208a7add..7f80a23b1f4cf2e7255545390789307bd3f74231 100644
+--- a/driver/MiniFilter.cpp
++++ b/driver/MiniFilter.cpp
+@@ -209,7 +209,7 @@ NTSTATUS SendFileDataToUserMode(PFLT_INSTANCE FltInstance,
+ 	return status;
+ }
+ 
+-_IRQL_requires_max_(APC_LEVEL)
++_IRQL_requires_max_(PASSIVE_LEVEL)
+ FLT_PREOP_CALLBACK_STATUS OnPreCreate(
+ 	_Inout_ PFLT_CALLBACK_DATA Data,
+ 	_In_ PCFLT_RELATED_OBJECTS FltObjects,
+@@ -253,22 +253,64 @@ FLT_PREOP_CALLBACK_STATUS OnPreCreate(
+ 		// The FO is being opened as a copy destination. This may or may not prove to be true.
+ 		// We don't know the source, but by observation, CopyFile opens it first so we should have it 
+ 		// in our list.
+-		PFILE_OBJECT PotentialSourceFileObject = g_SourceFileList->Find(HandleToUlong(PsGetCurrentProcessId()),
+-			HandleToUlong(PsGetCurrentThreadId()));
++		PFILE_OBJECT PotentialSourceFileObject = {};
++		NTSTATUS PreviousVerdict = STATUS_PENDING; // no verdict
+ 
+-		if (PotentialSourceFileObject)
++		// We need to deref the FO when done.
++		auto status = g_SourceFileList->Find(HandleToUlong(PsGetCurrentThreadId()),
++			PotentialSourceFileObject, PreviousVerdict);
++
++		if (NT_SUCCESS(status))
+ 		{
+ 			// We think we know the source that will be copied to the current FO. Let user mode know.
+ 			// We don't know the correct instance for this FO. It's OK.
+-            NTSTATUS userResult = STATUS_SUCCESS;
+-			auto status = SendFileDataToUserMode(nullptr, PotentialSourceFileObject, userResult);
++			NTSTATUS userResult = {};
+ 
+-			if (NT_SUCCESS(status) && !NT_SUCCESS(userResult))
++			UnicodeString processName;
++			Process p(PsGetCurrentProcess());
++			p.GetImageFileNameOnly(processName);
++
++            if (PreviousVerdict != STATUS_PENDING)
++            {
++				userResult = PreviousVerdict;
++
++				CommunicationPort::Instance()->SendOutputMessage(PortMessageType::FileMessage,
++					L"%wZ (%u,%u): Using cached verdict 0x%x for source file %wZ",
++					processName.Get(),
++					HandleToUlong(PsGetCurrentProcessId()),
++					HandleToUlong(PsGetCurrentThreadId()),
++					userResult,
++					&FilterFileNameInformation(Data).Get()->Name);
++
++				status = STATUS_SUCCESS;
++            }
++			else
+ 			{
+-				UnicodeString processName;
+-				Process p(PsGetCurrentProcess());
+-				p.GetImageFileNameOnly(processName);
++				status = SendFileDataToUserMode(nullptr, PotentialSourceFileObject, userResult);
++
++				if (NT_SUCCESS(status))
++				{
++					status = g_SourceFileList->UpdateVerdict(HandleToUlong(PsGetCurrentThreadId()),
++						PotentialSourceFileObject,
++						userResult);
++
++					CommunicationPort::Instance()->SendOutputMessage(PortMessageType::FileMessage,
++						L"%wZ (%u,%u): Caching verdict 0x%x for source file %wZ. Result: 0x%x",
++						processName.Get(),
++						HandleToUlong(PsGetCurrentProcessId()),
++						HandleToUlong(PsGetCurrentThreadId()),
++						userResult,
++						&FilterFileNameInformation(Data).Get()->Name,
++						status);
++
++				}
++			}
++
++			// We're done with the file object
++			ObDereferenceObject(PotentialSourceFileObject);
+ 
++			if (NT_SUCCESS(status) && !NT_SUCCESS(userResult))
++			{
+ 				CommunicationPort::Instance()->SendOutputMessage(PortMessageType::FileMessage,
+ 					L"%wZ (%u,%u): Blocking copy to %wZ with code 0x%x",
+ 					processName.Get(),
+@@ -368,9 +410,8 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 		p.GetImageFileNameOnly(processName);
+ 
+ 		CommunicationPort::Instance()->SendOutputMessage(PortMessageType::FileMessage,
+-			L"%wZ (%u,%u): Created context SH=%p, FO=%p, %wZ%ls%ls", 
++			L"%wZ (%u,%u): Created context FO=%p, %wZ%ls%ls", 
+ 			processName.Get(), HandleToUlong(PsGetCurrentProcessId()), HandleToUlong(PsGetCurrentThreadId()),
+-			context, 
+             FltObjects->FileObject,
+ 			&fileNameInfo->Name,
+ 			DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopyDestination(FltObjects->FileObject) ? L"\n\tOpened with copy destination flag" : L"",
+@@ -513,10 +554,9 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCleanup(_Inout_ PFLT_CALLBACK_DATA Data,
+ 	}
+ 
+ 	CommunicationPort::Instance()->SendOutputMessage(PortMessageType::FileMessage, 
+-		L"Cleaning up stream handle context 0x%p", context);
++		L"Cleaning up file object 0x%p", FltObjects->FileObject);
+ 
+ 	FltReleaseContext(context);
+-	FltDeleteContext(context);
+ 
+ 	return FLT_POSTOP_FINISHED_PROCESSING;
+ }
+@@ -529,7 +569,23 @@ FLT_PREOP_CALLBACK_STATUS OnPreClose(
+ {
+ 	UNREFERENCED_PARAMETER(Data);
+ 	UNREFERENCED_PARAMETER(FltObjects);
+-	*CompletionContext = nullptr;	
++	*CompletionContext = nullptr;
++
++	StreamHandleContext* context;
++
++	auto status = FltGetStreamHandleContext(FltObjects->Instance, FltObjects->FileObject, (PFLT_CONTEXT*)&context);
++	if (!NT_SUCCESS(status) || context == nullptr) {
++		//
++		// no context, continue normally
++		//
++		return FLT_PREOP_SUCCESS_NO_CALLBACK;
++	}
++
++	CommunicationPort::Instance()->SendOutputMessage(PortMessageType::FileMessage,
++		L"Closing file object 0x%p", FltObjects->FileObject);
++
++	FltDeleteContext(context);
++	FltReleaseContext(context);
+ 
+ 	return FLT_PREOP_SUCCESS_NO_CALLBACK;
+ }
+diff --git a/driver/SourceFileList.h b/driver/SourceFileList.h
+index 8a19d2ce85509907cb35a4f9443e85bbc5626efd..548ea1b1a889c7d5f155d8adc23f6ff647014964 100644
+--- a/driver/SourceFileList.h
++++ b/driver/SourceFileList.h
+@@ -8,6 +8,7 @@ struct SourceFileEntry
+     ULONG        ProcessId;
+     ULONG        ThreadId;
+     PFILE_OBJECT FileObject;
++    NTSTATUS     Verdict;
+ };
+ 
+ class SourceFileList 
+@@ -17,6 +18,7 @@ public:
+     SourceFileList()
+     {
+         m_List.Init();
++        m_Lock.Init();
+     }
+     ~SourceFileList()
+     {
+@@ -26,10 +28,13 @@ public:
+             ExFreePoolWithTag(entry, SOURCEFILE_POOLTAG);
+         }
+         m_List.Finalize();
++        m_Lock.Delete();
+     }
+ 
+     bool AddFirst(ULONG processId, ULONG threadId, PFILE_OBJECT fileObject)
+     {
++        Locker locker(m_Lock);
++
+         auto entry = (SourceFileEntry*)ExAllocatePool2(POOL_FLAG_PAGED, sizeof(SourceFileEntry), SOURCEFILE_POOLTAG);
+         if (!entry)
+         {
+@@ -38,10 +43,9 @@ public:
+ 
+         entry->ProcessId = processId;
+         entry->ThreadId = threadId;
+-        entry->FileObject = fileObject;
++        entry->FileObject = fileObject; // Don't add a ref here. We do it in find, so that we can still see CLOSE.
++        entry->Verdict = STATUS_PENDING; // No verdict yet
+ 
+-        // Let's be careful about lifetimes...
+-        ObReferenceObject(fileObject);
+         m_List.AddHead(entry);
+ 
+         return true;
+@@ -49,13 +53,15 @@ public:
+ 
+     bool Remove(PFILE_OBJECT fileObject)
+     {
++        Locker locker(m_Lock);
++
+         SourceFileEntry* entry = m_List.Find([fileObject](SourceFileEntry* e) 
+             { return e->FileObject == fileObject; });
+ 
+         if (entry)
+         {
+             m_List.RemoveItem(entry);
+-            ObDereferenceObject(fileObject); // We added a reference in AddFirst
++            // ObDereferenceObject(fileObject); // We no longer addref this when adding.
+             ExFreePoolWithTag(entry, SOURCEFILE_POOLTAG);
+             return true;
+         }
+@@ -63,10 +69,37 @@ public:
+         return false;
+     }
+ 
+-    PFILE_OBJECT Find(ULONG processId, ULONG threadId)
++    NTSTATUS UpdateVerdict(_In_ ULONG threadId, _In_ PFILE_OBJECT FileObject, _In_ NTSTATUS NewVerdict)
++    {
++        // We're doing an atomic operation here - we can use a shared locker.
++        SharedLocker locker(m_Lock);
++
++        SourceFileEntry* entry = m_List.Find([threadId](SourceFileEntry* e)
++            { return e->ThreadId == threadId; });
++
++        if (entry)
++        {
++
++            ASSERT(FileObject == entry->FileObject);
++
++            InterlockedExchange((volatile LONG*)&entry->Verdict, NewVerdict);
++
++            return STATUS_SUCCESS;
++        }
++
++        return STATUS_OBJECT_NAME_NOT_FOUND;
++    }
++
++    // Caller is responsible for calling ObDereferenceObject on the returned FO
++    NTSTATUS Find(ULONG threadId, _Out_ PFILE_OBJECT& FileObject, _Out_ NTSTATUS& Verdict)
+     {
+-        SourceFileEntry* entry = m_List.Find([processId, threadId](SourceFileEntry* e)
+-            { return e->ProcessId == processId && e->ThreadId == threadId; });
++        FileObject = nullptr;
++        Verdict = STATUS_PENDING; // no verdict
++
++        SharedLocker locker(m_Lock);
++
++        SourceFileEntry* entry = m_List.Find([threadId](SourceFileEntry* e)
++            { return e->ThreadId == threadId; });
+ 
+         if (entry)
+         {
+@@ -76,15 +109,15 @@ public:
+             // We use a file system trick for our sanity -- all FOs that point to the same stream
+             // have the same FsContext pointer. This is not quite true for network, but true enough
+             // for our purposes.
+-            m_List.ForEach([processId, threadId, entry](SourceFileEntry* e)
++            m_List.ForEach([threadId, entry](SourceFileEntry* e)
+             {
+-                if (e->ProcessId == processId && e->ThreadId == threadId)
++                if (e->ThreadId == threadId)
+                 {
+                     if (entry->FileObject->FsContext != e->FileObject->FsContext)
+                     {
+                         CommunicationPort::Instance()->SendOutputMessage(PortMessageType::FileMessage,
+                             L"Warning: Multiple source files found for PID %u TID %u - FsContext mismatch (0x%p vs 0x%p)",
+-                            processId,
++                            entry->ProcessId,
+                             threadId,
+                             entry->FileObject->FsContext,
+                             e->FileObject->FsContext);
+@@ -92,10 +125,14 @@ public:
+                 }
+             });
+ 
+-            return entry->FileObject;
++            // Let's be careful about lifetimes...
++            ObReferenceObject(entry->FileObject);
++            FileObject = entry->FileObject;
++            Verdict = entry->Verdict;
++            return STATUS_SUCCESS;
+         }
+ 
+-        return nullptr;
++        return STATUS_OBJECT_NAME_NOT_FOUND;
+     }
+ 
+     void* operator new (size_t s)
+@@ -115,4 +152,5 @@ public:
+ private:
+ 
+     LinkedList<SourceFileEntry> m_List;
++    EResource m_Lock;
+ };
+
+From bc9114bfd52e6b9026574944a9c8e9586cd1146f Mon Sep 17 00:00:00 2001
+From: aallidin <aallidin@cisco.com>
+Date: Tue, 16 Sep 2025 22:31:56 -0400
+Subject: [PATCH] Create SH context for destination file so we still see the
+ writes.
+
+---
+ driver/MiniFilter.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/driver/MiniFilter.cpp b/driver/MiniFilter.cpp
+index 7f80a23b1f4cf2e7255545390789307bd3f74231..53825593b1e2657408a4d65486e589a6ca16b7a1 100644
+--- a/driver/MiniFilter.cpp
++++ b/driver/MiniFilter.cpp
+@@ -376,6 +376,15 @@ FLT_POSTOP_CALLBACK_STATUS OnPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+ 								   HandleToUlong(PsGetCurrentThreadId()), 
+ 								   FltObjects->FileObject);
+ 	}
++	else if (DynamicImports::Instance()->IoCheckFileObjectOpenedAsCopyDestination(FltObjects->FileObject))
++	{
++		if (0 == (desiredAccess & FILE_WRITE_DATA))
++		{
++			return FLT_POSTOP_FINISHED_PROCESSING;
++		}
++
++		// Otherwise, continue on and assign a SH context.
++	}
+ 	else
+ 	{
+ 		return FLT_POSTOP_FINISHED_PROCESSING;
+
+From 1752ba666899ea5a8b1894a3b4fa16f71529685d Mon Sep 17 00:00:00 2001
+From: aallidin <aallidin@cisco.com>
+Date: Wed, 17 Sep 2025 13:31:41 -0400
+Subject: [PATCH] Bugfixes.
+
+---
+ driver/Communication.cpp | 9 ++++-----
+ driver/MiniFilter.cpp    | 5 +++--
+ 2 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/driver/Communication.cpp b/driver/Communication.cpp
+index a744c82e1184ea9e29bb38424c887171338784fb..214e0e2194a9fb2442abf48a8fdcdd4c09c24307 100644
+--- a/driver/Communication.cpp
++++ b/driver/Communication.cpp
+@@ -80,8 +80,6 @@ NTSTATUS CommunicationPort::SendOutputMessage(_In_ PortMessageType type, _In_ LP
+ 			{
+ 				msg->stringMsg.dataLenBytes = tmpString.Length;
+ 
+-				// LARGE_INTEGER timeout;
+-				// timeout.QuadPart = -10000 * 100; // 100 msec
+ 				status = FltSendMessage(m_Filter,
+ 					&m_ClientPort,
+ 					msg,
+@@ -161,15 +159,16 @@ NTSTATUS CommunicationPort::SendSectionMessage(_In_ HANDLE SectionHandle,
+ 			PortReply reply = {};
+             ULONG replyLength = sizeof(reply);
+ 
+-			// LARGE_INTEGER timeout;
+-			// timeout.QuadPart = -10000 * 100; // 100 msec
++			LARGE_INTEGER timeout;
++			timeout.QuadPart = -10000 * 1000 * 10; // 10 seconds
++
+ 			status = FltSendMessage(m_Filter,
+ 				&m_ClientPort,
+ 				msg,
+ 				sizeof(PortMessage),
+ 				&reply,
+ 				&replyLength,
+-				nullptr);
++				&timeout);
+ 
+ 			ExFreePool(msg);
+ 
+diff --git a/driver/MiniFilter.cpp b/driver/MiniFilter.cpp
+index 53825593b1e2657408a4d65486e589a6ca16b7a1..120053e1ea536c7d191aae1e81d213a123b29bf0 100644
+--- a/driver/MiniFilter.cpp
++++ b/driver/MiniFilter.cpp
+@@ -738,11 +738,12 @@ NTSTATUS MinifilterUnload(FLT_FILTER_UNLOAD_FLAGS Flags)
+ {
+ 	UNREFERENCED_PARAMETER(Flags);
+ 
+-
+-	delete g_SourceFileList;
+ 	CommunicationPort::Instance()->FinalizeFilterPort();
+ 	FltUnregisterFilter(g_Filter);
+ 
++	// Do this after we unregister the filter
++	delete g_SourceFileList;
++
+ 	return STATUS_SUCCESS;
+ }
+ 
+
+From b12a9beb3d2f38f9d72449c32f26aa65aafd6946 Mon Sep 17 00:00:00 2001
+From: aallidin <aallidin@cisco.com>
+Date: Wed, 17 Sep 2025 14:44:51 -0400
+Subject: [PATCH] Fix naming.
+
+---
+ driver/Driver.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/driver/Driver.h b/driver/Driver.h
+index c7879d1ace21ad7ab11a056f08d5d091411b75b3..7a46cce21c0a60d67799d2d9c569ab5bbebd4589 100644
+--- a/driver/Driver.h
++++ b/driver/Driver.h
+@@ -2,7 +2,7 @@
+ 
+ extern PFLT_FILTER g_Filter;
+ 
+-#define DRIVER_PREFIX "Backup: "
++#define DRIVER_PREFIX "CopyDetect: "
+ 
+ NTSTATUS InitMiniFilter(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath);
+ NTSTATUS MinifilterUnload(FLT_FILTER_UNLOAD_FLAGS Flags);
