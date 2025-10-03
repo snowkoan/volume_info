@@ -2,6 +2,7 @@
 What volume information is available during the [Filter Manager instance setup callback](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fltkernel/nc-fltkernel-pflt_instance_setup_callback)?
 
 Originally forked from @zoadiacon: https://github.com/zodiacon/windowskernelprogrammingbook2e/tree/master/Chapter12/KBackup2
+Thanks to Claude for writing all that tedious enum -> string code.
 
 # building
 1. This should build against WDK 10.0.22621.0 and later. I'm not sure about earlier versions.
